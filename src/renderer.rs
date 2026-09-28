@@ -1,157 +1,182 @@
-//! GPU renderer: the wgpu device, the per-pixel complex-function compute
-//! pipeline, and the fullscreen blit that presents the result to the window.
+//! GPU renderer: the per-pixel complex-function compute kernel, and the
+//! hand-off of its output to egui for display.
 //!
-//! # The two-pass shape, and why
+//! # Where the GPU work actually happens
 //!
-//! Nothing in this program draws geometry in the usual sense. Every pixel is
-//! the independent evaluation of a complex function, so the natural mapping is
-//! *one invocation per pixel* — which is what a compute shader is for, and what
-//! a fragment shader is bad at (fragment shaders are latency-bound on
-//! divergence; a million escape-time iterations per pixel is precisely the
-//! workload that makes every lane in a SIMD quad wait for the slowest one).
-//! So the frame is:
+//! This module owns **no surface, no swap chain and no window**. eframe 0.36
+//! creates the `wgpu::Instance`, the adapter, the device, the queue, the surface
+//! and the swap chain before `App::new` is ever called, and there is no public
+//! hook to replace any of it — `eframe::native::wgpu_integration` is entirely
+//! private. So this renderer *shares* eframe's device rather than competing with
+//! it. The device and queue arrive by cloning the handles out of
+//! [`egui_wgpu::RenderState`], which is a few `Arc` bumps rather than a copy.
+//!
+//! The frame is then one pass:
 //!
 //! 1. a **compute pass** evaluates `f(z)` for every texel of an off-screen
-//!    `rgba8unorm` storage texture;
-//! 2. a **render pass** samples that texture through a fullscreen triangle and
-//!    writes it into the swap-chain image.
+//!    `rgba8unorm` storage texture, one invocation per texel;
+//! 2. that texture is **registered with egui's own renderer**, which blits it to
+//!    the window as an ordinary egui image in a later part of the same frame.
 //!
-//! The split exists for one concrete reason: `texture_storage_2d<..., write>`
-//! is **write-only** by the WebGPU spec, so the compute pass physically cannot
-//! read the image back, and a plain `texture_2d<f32>` binding — which is what a
-//! fragment shader can sample — is not legal in a compute shader at all in the
-//! core spec. Two passes, two binding tables, one texel-for-texel blit.
+//! Nothing here does colour work, gamma correction or tone mapping, and nothing
+//! here touches the swap chain. The compute pass exists because every pixel is
+//! an independent function evaluation, which is what compute shaders are for and
+//! what fragment shaders are bad at: a fragment shader is latency-bound on
+//! divergence, and thousands of escape-time iterations per pixel is precisely
+//! the workload that makes every lane of a SIMD quad wait for the slowest one.
 //!
-//! # The WGSL contract (READ THIS BEFORE EDITING THE SHADERS)
+//! # The WGSL contract (READ THIS BEFORE EDITING THE SHADER)
 //!
-//! The Rust side declares explicit [`wgpu::BindGroupLayout`]s and hands the
-//! shader compiler an explicit `PipelineLayout`, so a mismatch with the WGSL is
-//! a **hard validation error at pipeline-creation time**, not a silently wrong
-//! picture. The layout the shaders must match exactly is:
+//! The Rust side declares an explicit [`wgpu::BindGroupLayout`] and hands the
+//! compiler an explicit `PipelineLayout`, so a mismatch with the WGSL is a
+//! **hard validation error at pipeline-creation time**, not a silently wrong
+//! picture. `shaders/domain_coloring.wgsl` must match exactly:
 //!
-//! | Pass | `@group` | `@binding` | WGSL declaration |
+//! | `@group` | `@binding` | WGSL declaration | Rust [`wgpu::BindingType`] |
 //! |---|---|---|---|
-//! | compute | `0` | `0` | `var<uniform> uniforms: Uniforms;` |
-//! | compute | `0` | `1` | `var output_texture: texture_storage_2d<rgba8unorm, write>;` |
-//! | blit | `0` | `0` | `var input_texture: texture_2d<f32>;` |
-//! | blit | `0` | `1` | `var linear_sampler: sampler;` |
+//! | `0` | `0` | `var<uniform> uniforms: Uniforms;` | `Buffer { ty: Uniform }` |
+//! | `0` | `1` | `var output_texture: texture_storage_2d<rgba8unorm, write>;` | `StorageTexture { access: WriteOnly, format: Rgba8Unorm }` |
 //!
-//! The blit pass deliberately binds **no** uniform buffer. The fullscreen
-//! triangle covers the viewport, so the shader needs nothing but its own
-//! position, which the rasteriser supplies. The two passes therefore have
-//! different binding tables at group 0, which is one more reason they live in
-//! separate shader modules: a pipeline layout is shared by every entry point in
-//! one module, so combining them would force a dummy binding into one of them.
+//! The `@compute` entry point is `main` and the workgroup is `(8, 8)`; both are
+//! passed explicitly to wgpu rather than inferred, so renaming either in the
+//! shader without updating the constants below fails loudly at startup instead
+//! of silently running a different kernel.
 //!
-//! The same applies to the entry-point names in the constants below. If a
-//! shader author renames `main` to something else, update the constant in this
-//! file, or pipeline creation will fail loudly rather than silently.
+//! **The kernel flips Y and nothing else must.** It maps texture row 0 to
+//! `+scale` on the imaginary axis (`im = center.y + (1.0 - uv.y * 2.0) * scale`).
+//! That is correct *because* egui samples the texture with `v = 0` at the top of
+//! the screen. There is no second flip anywhere in this file, so the flip looks
+//! redundant until you remember it is what makes row 0 the top. Do not "fix" it.
 //!
-//! The Y-axis is flipped in *both* shaders, and the two flips cancel — do not
-//! "fix" either one. The kernel maps texture row 0 to `+scale` on the imaginary
-//! axis (`im = center.y + (1.0 - uv.y * 2.0) * scale`), and the blit maps
-//! texture `v = 0` to the top of the screen (`uv.y = (1.0 - clip.y) * 0.5`).
-//! Remove either flip and every plot in the program is mirrored.
+//! # The `uniforms.resolution` contract
 //!
-//! # Async without a runtime
+//! `uniforms.resolution` **must** equal [`Renderer::size`] exactly, in physical
+//! pixels. The kernel bounds-checks its dispatch against the uniform but
+//! `textureStore`s into an image of `size()`.
 //!
-//! [`Renderer::new`] is `async` because wgpu's adapter and device requests are
-//! futures. It deliberately does **not** block on them: `pollster` and
-//! `futures-lite` appear in `Cargo.lock` only as transitive dependencies of
-//! `eframe`, and Rust does not let you `use` a crate that is not in your own
-//! `[dependencies]`. Adding one would mean editing `Cargo.toml`, which this
-//! module does not own. The caller is expected to have an executor available;
-//! that keeps the renderer free of any opinion about *how* the frame loop is
-//! driven.
+//! * Uniform **larger** than the image: the shader's own bounds check admits
+//!   invocations that store past the end of the texture. That is undefined
+//!   behaviour, not a dropped pixel.
+//! * Uniform **smaller**: the right and bottom edges are never written and keep
+//!   stale contents from the previous frame, which during a resize is a smear of
+//!   the old plot.
+//!
+//! [`Renderer::render`] does **not** overwrite the field to paper over a
+//! mismatch. Silently substituting a different resolution would shift every
+//! plot's mapping and hide the disagreement that caused it, which is a far worse
+//! failure than an obvious one. The caller must set the field from
+//! [`Renderer::size`] — see [`Renderer::resize`] for which pixel count that is.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+// The wgpu renderer is reached through eframe's re-export rather than by adding
+// a direct `egui-wgpu` dependency. eframe re-exports `egui_wgpu` under its
+// `wgpu_no_default_features` feature, which its own default `wgpu` feature
+// enables, so this path is live in a default build. It also guarantees a single
+// wgpu crate in the type namespace: a direct `egui-wgpu` dependency that
+// resolved to a different feature set would produce a *second*, nominally
+// identical `wgpu::Device` type, and nothing would compile. `Cargo.lock` pins one
+// wgpu 30.0.1 for both, so `state.device` is the same type as the `wgpu::Device`
+// imported below.
+use eframe::egui;
+use eframe::egui_wgpu;
+
 use crate::uniforms::{Uniforms, UNIFORM_BUFFER_SIZE};
 
 // ---------------------------------------------------------------------------
-// Shader sources and the names inside them.
+// Shader source and the names inside it.
 //
-// These constants are the *only* places in the program that know where the
-// shaders live or what they are called. Both WGSL files are embedded with
-// `include_str!` rather than read at runtime: a missing or renamed shader then
-// fails the build with a file-not-found error instead of producing a blank
-// window that is painful to diagnose.
+// `include_str!` rather than a runtime read: a missing or renamed shader then
+// fails the build with a file-not-found error instead of producing a permanently
+// black plot that is miserable to diagnose.
 //
-// NOTE FOR INTEGRATORS: the WGSL files are authored in a separate lane. If
-// either is renamed, change `COMPUTE_SHADER_PATH` / `BLIT_SHADER_PATH` *and*
-// the `include_str!` literals below. The macro requires a string literal, so
-// the constant and the literal have to be kept in step by hand; the constant
-// exists to record the path in one obvious, greppable place.
+// NOTE FOR INTEGRATORS: `shaders/domain_coloring.wgsl` is authored in a
+// separate lane. If it is renamed, change `COMPUTE_SHADER_PATH` *and* the
+// `include_str!` literal below. The macro needs a string literal, so the
+// constant and the literal must be kept in step by hand; the constant exists to
+// record the path in one obvious, greppable place.
 // ---------------------------------------------------------------------------
 
 /// Where the domain-colouring compute shader lives, relative to `Cargo.toml`.
 const COMPUTE_SHADER_PATH: &str = "shaders/domain_coloring.wgsl";
 
-/// Where the fullscreen blit shader lives, relative to `Cargo.toml`.
-const BLIT_SHADER_PATH: &str = "shaders/blit.wgsl";
-
 /// Source of the compute kernel, embedded at compile time.
 const COMPUTE_SHADER_SRC: &str = include_str!("../shaders/domain_coloring.wgsl");
 
-/// Source of the blit vertex/fragment pair, embedded at compile time.
-const BLIT_SHADER_SRC: &str = include_str!("../shaders/blit.wgsl");
-
 /// `@compute` entry point in [`COMPUTE_SHADER_SRC`].
 ///
-/// This is passed explicitly rather than left to wgpu's "exactly one compute
-/// stage in the module" inference, so that adding a second experimental kernel
-/// to the same file later cannot silently change which one we run.
+/// Passed explicitly rather than left to wgpu's "exactly one compute stage in
+/// the module" inference, so that adding a second experimental kernel to the
+/// same file later cannot silently change which one runs.
 const COMPUTE_ENTRY_POINT: &str = "main";
-
-/// `@vertex` entry point in [`BLIT_SHADER_SRC`].
-const BLIT_VERTEX_ENTRY_POINT: &str = "vs_main";
-
-/// `@fragment` entry point in [`BLIT_SHADER_SRC`].
-const BLIT_FRAGMENT_ENTRY_POINT: &str = "fs_main";
 
 /// Edge length of the compute workgroup square, in invocations.
 ///
-/// **This number is a contract, not a tuning knob.** The workgroup count
-/// dispatched in [`Renderer::render`] is `ceil(size / WORKGROUP_SIZE)` in each
-/// axis, and the kernel guards every invocation with a bounds check, so a
-/// partial final workgroup writes only the pixels that exist. It must match
-/// `@workgroup_size(x, y)` in [`COMPUTE_SHADER_SRC`] — currently `(8, 8)` — and
-/// wgpu cannot check that for us. A mismatch here is a disagreement about how
-/// many invocations a workgroup holds, which is an out-of-bounds write, not a
-/// compile error.
+/// **A contract, not a tuning knob.** [`Renderer::render`] dispatches
+/// `ceil(size / WORKGROUP_SIZE)` workgroups in each axis and the kernel guards
+/// every invocation with a bounds check, so a partial final workgroup writes
+/// only the pixels that exist. It must match `@workgroup_size(x, y)` in
+/// [`COMPUTE_SHADER_SRC`] — currently `(8, 8)`. wgpu cannot check that for us, and
+/// a mismatch is a disagreement about how many invocations a workgroup holds,
+/// which is an out-of-bounds write rather than a compile error.
 const WORKGROUP_SIZE: u32 = 8;
 
-/// Format of the intermediate image the compute pass writes.
+/// Format of the image the compute pass writes and egui samples.
 ///
-/// `Rgba8Unorm` is one of the formats the WebGPU spec *guarantees* supports
-/// `STORAGE_BINDING` with write-only access (the `Bgra8Unorm` case is the one
-/// that needs a feature flag; `Rgba8Unorm` does not), so this needs no optional
-/// device feature and cannot fail on a conformant backend. The WGSL side must
-/// spell it `texture_storage_2d<rgba8unorm, write>`.
+/// `Rgba8Unorm` is required, not chosen: `egui_wgpu::Renderer::register_native_texture`
+/// documents that a native texture "must have the format
+/// [`wgpu::TextureFormat::Rgba8Unorm`]", and the WGSL side must spell it
+/// `texture_storage_2d<rgba8unorm, write>`.
+///
+/// It is also one of the formats the WebGPU spec *guarantees* supports
+/// `STORAGE_BINDING` with write-only access — the `Bgra8Unorm` case is the one
+/// that needs a feature flag, this does not — so no optional device feature is
+/// required and the compute pass cannot fail on a conformant backend.
 const STORAGE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// How egui should sample the plot when it draws it as an image.
+///
+/// This is a description, not a `wgpu::Sampler`. egui builds the actual sampler
+/// and the bind group inside its own render pass, so there is no binding left
+/// here for a sampler object to occupy; keeping the *configuration* as a named
+/// constant is what preserves the intent.
+///
+/// `Linear` is **mandatory**, not a preference. egui-wgpu's own texture bind
+/// group layout declares binding 1 as `SamplerBindingType::Filtering` alongside
+/// `TextureSampleType::Float { filterable: true }`, so registering with
+/// `FilterMode::Nearest` is a validation error at registration time.
+///
+/// `ClampToEdge` on every axis matters because egui images are drawn with uv
+/// coordinates that can reach slightly outside `0..1`; a repeat or mirror mode
+/// would drag the opposite edge of the plot into view.
+///
+/// `lod_max_clamp: 0.0` pins sampling to mip level 0. The plot is a single mip
+/// level, so any nonzero maximum is meaningless, and pinning it makes an
+/// accidental future mip chain impossible to sample by accident.
+const PLOT_SAMPLER: wgpu::SamplerDescriptor<'static> = wgpu::SamplerDescriptor {
+    label: Some("steel-pulse:plot:sampler"),
+    address_mode_u: wgpu::AddressMode::ClampToEdge,
+    address_mode_v: wgpu::AddressMode::ClampToEdge,
+    address_mode_w: wgpu::AddressMode::ClampToEdge,
+    mag_filter: wgpu::FilterMode::Linear,
+    min_filter: wgpu::FilterMode::Linear,
+    mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+    lod_min_clamp: 0.0,
+    lod_max_clamp: 0.0,
+    // egui's own bind group supplies its own sampler; a comparison function
+    // here would be ignored at best and misleading at worst.
+    compare: None,
+    // Must be at least 1. Anything higher would force every filter mode to be
+    // linear, including the mip filter, which is not what `Nearest` above says.
+    anisotropy_clamp: 1,
+    // Only consulted by `AddressMode::ClampToBorder`, which the plot never uses.
+    border_color: None,
+};
 
 /// Version string shown in the UI's backend line.
 const WGPU_VERSION_LABEL: &str = "30.0.1";
-
-/// Vertex count of the fullscreen triangle.
-///
-/// Three, not four: a single triangle that overshoots the viewport covers every
-/// pixel with no diagonal seam and no index buffer, and the GPU clips the
-/// overhang for free. The shader derives clip-space positions from
-/// `vertex_index` alone, so there is no vertex buffer at all.
-const FULLSCREEN_TRIANGLE_VERTICES: u32 = 3;
-
-/// Frames allowed between acquiring a swap-chain image and presenting it.
-///
-/// Capped at 2 rather than 1. With 1 the CPU and GPU are forced into lockstep —
-/// the CPU cannot record frame N+1 until the GPU has finished N, which halves
-/// throughput and makes pan/zoom feel mushy. With 3 or more, extra frames of
-/// input latency become perceptible. 2 is the balance point, and it is also what
-/// wgpu's own `get_default_config` picks. On Metal this becomes
-/// `CAMetalLayer.maximumDrawableCount = 3`.
-const DESIRED_MAX_FRAME_LATENCY: u32 = 2;
 
 /// Bytes occupied by a single resolved timestamp query.
 ///
@@ -166,29 +191,29 @@ const TIMESTAMP_QUERY_BYTES: u64 = wgpu::QUERY_SIZE as u64;
 /// Everything that can go wrong while bringing the renderer up.
 ///
 /// Each variant carries a human-readable explanation rather than a bare wgpu
-/// enum variant. A user who sees this in a window title needs to learn *what to
-/// do* — "your GPU is too old" is actionable, `RequestAdapterError::NotFound`
-/// is not.
+/// enum variant. A user who sees this in a window needs to learn *what to do* —
+/// "this build of eframe was compiled without the wgpu renderer" is actionable,
+/// `Renderer::Wgpu` is not.
+///
+/// There is no `NoAdapter` or `DeviceRequest` variant any more: eframe already
+/// requested the adapter and the device before this module is ever reached, and
+/// a failure there is an eframe startup failure with its own error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RendererError {
-    /// No adapter satisfied the request. By far the most common failure on a
-    /// developer machine, and almost never a bug in this program.
-    NoAdapter {
-        /// Human-readable cause, naming the likely fix.
-        cause: String,
-    },
-    /// The surface cannot be used with the adapter we picked, or reports no
-    /// usable configuration. Usually means the surface was created from a
-    /// window handle the chosen backend does not support.
-    UnsupportedSurface {
+    /// The `AdapterInfo` could not be read, or the supplied state was
+    /// inconsistent. In practice this means the render state did not come from a
+    /// live wgpu adapter.
+    UnusableRenderState {
         /// Human-readable cause.
         cause: String,
     },
-    /// The adapter existed but the device request was refused, typically
-    /// because a requested limit or feature is out of range.
-    DeviceRequest {
-        /// Human-readable cause, including wgpu's own explanation.
+    /// The compute pipeline could not be built. Almost always a WGSL error in
+    /// [`COMPUTE_SHADER_SRC`] or a binding layout that no longer matches the
+    /// table at the top of this file. The underlying wgpu diagnostic is in
+    /// `cause`.
+    PipelineCreation {
+        /// Human-readable cause.
         cause: String,
     },
 }
@@ -196,27 +221,21 @@ pub enum RendererError {
 impl fmt::Display for RendererError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoAdapter { cause } => write!(
+            Self::UnusableRenderState { cause } => write!(
                 f,
-                "could not find a usable GPU adapter ({cause}). \
-                 This usually means the machine has no GPU that wgpu can drive, \
-                 that a driver is too old for wgpu {WGPU_VERSION_LABEL}, or that \
-                 the process is sandboxed without graphics access. \
-                 Try updating the graphics driver, or run on a machine with a \
-                 discrete or integrated GPU exposed to the window server."
+                "the eframe wgpu render state is unusable ({cause}). \
+                 This usually means eframe was built with the `glow` renderer \
+                 instead of `wgpu`. Check that `eframe`'s default features are \
+                 enabled and that `Renderer::Wgpu` is passed in the native \
+                 options."
             ),
-            Self::UnsupportedSurface { cause } => write!(
+            Self::PipelineCreation { cause } => write!(
                 f,
-                "the window surface is not usable with the selected GPU adapter \
-                 ({cause}). The surface was probably created from a window \
-                 handle the active wgpu backend does not support; recreating the \
-                 surface after the device is known usually fixes it."
-            ),
-            Self::DeviceRequest { cause } => write!(
-                f,
-                "the GPU adapter was found but refused to create a device \
-                 ({cause}). This usually means the adapter does not support the \
-                 requested limits or optional features."
+                "the domain-colouring compute pipeline could not be created \
+                 ({cause}). Check {COMPUTE_SHADER_PATH} for a WGSL compile \
+                 error, and check that its `@group(0) @binding(0)` uniform and \
+                 `@binding(1)` rgba8unorm storage texture still match the \
+                 bind group layout in src/renderer.rs."
             ),
         }
     }
@@ -225,16 +244,68 @@ impl fmt::Display for RendererError {
 impl std::error::Error for RendererError {}
 
 // ---------------------------------------------------------------------------
+// What one frame produced
+// ---------------------------------------------------------------------------
+
+/// The result of one [`Renderer::render`] call: what to draw, at what size, and
+/// how long the GPU took.
+///
+/// Returned by value rather than pulled off the renderer with accessors so that
+/// a frame is self-describing. The app layer caches the three fields in its own
+/// state and only has to look at [`Renderer`] again when it resizes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RenderOutcome {
+    /// The egui texture handle to draw with [`egui::Image::from_texture`], or
+    /// `None` if the GPU path is unavailable.
+    ///
+    /// **Always `Some` in the current implementation.** egui's renderer lock is
+    /// `epaint::mutex::RwLock`, which wraps `parking_lot` and therefore has no
+    /// poisoning state, and registration cannot otherwise fail. The `Option` is
+    /// kept anyway, for two reasons: it forces callers to handle the
+    /// unavailable case rather than `unwrap`, and it gives a future failure mode
+    /// — a lost device, a renderer dropped by eframe — somewhere honest to
+    /// report. Handling it costs one `if let`.
+    ///
+    /// If it is ever `None`, the compute pass still ran; the result is sitting
+    /// in the storage texture, it simply cannot be referenced from the UI. The
+    /// app should surface an error rather than silently draw nothing.
+    ///
+    /// The handle is stable across frames and is only replaced after a
+    /// [`Renderer::resize`], so it is safe to cache. Always take the value from
+    /// the current frame's outcome rather than holding an old one: after a
+    /// resize the previous handle has been freed and refers to a destroyed view.
+    pub texture: Option<egui::TextureId>,
+    /// Size of the storage texture, `(width, height)`, in **physical pixels**.
+    ///
+    /// This is the value that must be written into `uniforms.resolution`; see
+    /// the module documentation. Always the renderer's current size, never a
+    /// stale one, so it doubles as the trigger for a resize comparison.
+    pub size: (u32, u32),
+    /// GPU time for the compute pass, in milliseconds, or `None` if it is not
+    /// known yet.
+    ///
+    /// `None` is the honest answer in three distinct cases, and it is never a
+    /// fabricated `0.0`:
+    ///
+    /// * timestamps were never enabled (the default — see
+    ///   [`Renderer::enable_timestamps`]);
+    /// * the device was created without `wgpu::Features::TIMESTAMP_QUERY`;
+    /// * the readback for this frame has not completed yet. The value is a frame
+    ///   or two behind by construction, because reading it is non-blocking.
+    pub gpu_ms: Option<f64>,
+}
+
+// ---------------------------------------------------------------------------
 // Optional GPU timing
 // ---------------------------------------------------------------------------
 
-/// Mutable state shared between the frame loop and the `map_async` callback
-/// wgpu invokes once the GPU has finished copying query results.
+/// Mutable state shared between the frame loop and the `map_async` callback wgpu
+/// invokes once the GPU has finished copying query results.
 ///
 /// It lives behind an [`Arc`] + [`Mutex`] because the mapping callback is
-/// `FnOnce(..) + Send + 'static` — it cannot borrow from `self`. The [`Mutex`]
-/// is never held across a GPU call, so contention is not a concern; it is only
-/// ever locked for a handful of field assignments.
+/// `FnOnce(..) + Send + 'static` — it cannot borrow from `self`. The [`Mutex`] is
+/// never held across a GPU call, so contention is not a concern; it is only ever
+/// locked for a handful of field assignments.
 #[derive(Debug, Default)]
 struct TimestampState {
     /// `true` while a staging-buffer mapping is outstanding. Prevents a second
@@ -243,7 +314,7 @@ struct TimestampState {
     /// Most recent successfully decoded compute-pass duration.
     latest: Option<Duration>,
     /// How many readbacks failed or produced nonsense. Surfaced so that a
-    /// silently-frozen telemetry readout is distinguishable from a GPU that is
+    /// silently frozen telemetry readout is distinguishable from a GPU that is
     /// genuinely never finishing.
     dropped: u64,
 }
@@ -253,116 +324,122 @@ struct TimestampState {
 /// A panic inside the mapping callback would poison this lock. Everything behind
 /// it is a `bool`, an `Option<Duration>` and a `u64` — all independently valid
 /// after a panic — so it is always safe to keep using. Propagating the poison
-/// would turn a telemetry glitch into a dead render loop, which is a
-/// disproportionate outcome for a value nothing blocks on.
+/// would turn a telemetry glitch into a dead render loop, which is wildly
+/// disproportionate for a value nothing blocks on.
 fn lock_timestamps(state: &Mutex<TimestampState>) -> std::sync::MutexGuard<'_, TimestampState> {
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The intermediate image and the two bind groups that reference it.
+// ---------------------------------------------------------------------------
+// The storage target
+// ---------------------------------------------------------------------------
+
+/// The intermediate image and the bind group that writes it.
 ///
-/// Bundled into one value because the objects are only ever valid together:
-/// recreating the texture without recreating the bind groups leaves the pipelines
-/// bound to a destroyed view.
+/// Bundled because the objects are only ever valid together: recreating the
+/// texture without recreating the bind group leaves the pipeline bound to a
+/// destroyed view.
 struct StorageTarget {
-    /// The `rgba8unorm` image the compute pass writes.
+    /// The `rgba8unorm` image the compute pass writes and egui samples.
     texture: wgpu::Texture,
-    /// View of [`StorageTarget::texture`] narrowed to `STORAGE_BINDING`, for the
-    /// compute pass's write-only image.
+    /// View narrowed to `STORAGE_BINDING`, for the compute pass's write-only
+    /// image.
     storage_view: wgpu::TextureView,
-    /// View of [`StorageTarget::texture`] narrowed to `TEXTURE_BINDING`, for the
-    /// blit pass's `texture_2d<f32>`.
+    /// View narrowed to `TEXTURE_BINDING`, for egui's `texture_2d<f32>`.
     ///
-    /// Two views of one image rather than one shared view. They must exist
-    /// separately because a `texture_2d<f32>` and a
-    /// `texture_storage_2d<..., write>` are different binding types, and
-    /// narrowing each view to the single usage it is bound with makes that
-    /// distinction impossible to get wrong by accident.
+    /// Two views of one image rather than one shared view: a
+    /// `texture_2d<f32>` and a `texture_storage_2d<..., write>` are different
+    /// binding types, and narrowing each view to the single usage it is bound
+    /// with makes that distinction impossible to get wrong by accident.
     sampled_view: wgpu::TextureView,
     /// Uniform + storage view, for the compute pass.
     compute_bind_group: wgpu::BindGroup,
-    /// Sampled view + sampler, for the blit pass.
-    blit_bind_group: wgpu::BindGroup,
 }
 
 // ---------------------------------------------------------------------------
 // Renderer
 // ---------------------------------------------------------------------------
 
-/// Owns the wgpu device, the two pipelines that make up a frame, and every
-/// resource they bind.
+/// Owns the compute pipeline that evaluates the complex function per pixel, and
+/// the off-screen image it writes, and keeps that image registered with egui.
 ///
-/// # Ownership and lifetime
+/// # Sharing eframe's device
 ///
-/// The `Surface` is taken as an `Arc` and held for as long as the renderer
-/// lives. wgpu's `Surface<'window>` borrows the platform window handle, and the
-/// handle must outlive every acquire; keeping the `Arc` in a `'static` renderer
-/// makes that the caller's problem exactly once, at surface creation, instead of
-/// a constraint on every subsequent frame.
+/// The `Device` and `Queue` are clones of eframe's, obtained from
+/// [`egui_wgpu::RenderState`]. Both are `Arc`-backed handles inside wgpu, so
+/// cloning is a refcount bump and the renderer is not creating a second logical
+/// device. That is the point: a second device would mean a second set of
+/// resources with no shared memory, and there would be no way to get our
+/// texture onto eframe's swap chain anyway.
 ///
 /// # Threading
 ///
 /// `Renderer` is `Send + Sync` — asserted at compile time at the bottom of this
 /// file, not merely claimed — but it is *not* internally synchronised. Treat it
 /// as owned by whichever thread drives the frame loop, which in this program is
-/// the egui main thread. The only interior mutability is the timestamp state,
-/// which is genuinely shared with a wgpu callback and is why it is the one
-/// place a `Mutex` appears.
+/// the egui main thread. The only shared mutable state is
+/// [`TimestampState`], which is genuinely shared with a wgpu callback.
 pub struct Renderer {
-    /// The logical device. Every pipeline, buffer and texture hangs off this.
+    /// Clone of eframe's logical device. Every resource here hangs off it.
     device: wgpu::Device,
-    /// The queue all uploads and submissions go through.
+    /// Clone of eframe's queue. All uploads and submissions go through it.
     queue: wgpu::Queue,
-    /// What the adapter told us about itself; the source of the UI's backend
-    /// line. Captured at construction because the `Adapter` itself is not kept.
-    adapter_info: wgpu::AdapterInfo,
-    /// The window surface we present into. Shared with the caller, which may
-    /// need it to reconfigure on its own schedule.
-    surface: Arc<wgpu::Surface<'static>>,
-    /// Live swap-chain configuration. Mutated by [`Renderer::resize`] and
-    /// re-applied to the surface whenever the size actually changes.
-    config: wgpu::SurfaceConfiguration,
-    /// Size of the intermediate image, `(width, height)`, in physical pixels.
+    /// egui's renderer, shared with eframe. Held so the compute output can be
+    /// registered and unregistered without the app layer handling the lock.
     ///
-    /// Clamped to at least `1x1`; see [`Renderer::resize`] for why a zero is
-    /// fatal rather than merely useless.
-    size: (u32, u32),
+    /// `epaint::mutex::RwLock`, not `std::sync::RwLock`: that is the type
+    /// `RenderState::renderer` actually is, and naming anything else here would
+    /// be a distinct type that the compiler refuses to assign. epaint's wrapper
+    /// is `parking_lot` underneath, so it has no poisoning state to recover from
+    /// and `write()` hands back a guard directly rather than a `Result`.
+    egui_renderer: Arc<egui::epaint::mutex::RwLock<egui_wgpu::Renderer>>,
+    /// What the adapter reported about itself; the source of the UI's backend
+    /// line. Captured once because the adapter itself is not kept.
+    adapter_info: wgpu::AdapterInfo,
+    /// Rendered once at construction: the list of adapters wgpu could see.
+    ///
+    /// A `String` rather than the `Vec<wgpu::Adapter>` itself because
+    /// `RenderState::available_adapters` is `#[cfg]`-gated to non-wasm targets
+    /// and holding adapter handles open for the life of the app serves no
+    /// purpose. Reading it at construction also keeps that platform assumption
+    /// in exactly one place.
+    adapter_list: String,
 
     /// Evaluates the complex function, one invocation per texel.
     compute_pipeline: wgpu::ComputePipeline,
     /// Explicit layout for [`Renderer::compute_pipeline`]; kept alive because a
     /// `BindGroup` may not outlive the layout it was created against.
     compute_layout: wgpu::BindGroupLayout,
-    /// Samples the intermediate image onto the swap-chain image.
-    blit_pipeline: wgpu::RenderPipeline,
-    /// Explicit layout for [`Renderer::blit_pipeline`].
-    blit_layout: wgpu::BindGroupLayout,
-
     /// 64 bytes of [`Uniforms`], re-uploaded once per frame.
     uniform_buffer: wgpu::Buffer,
 
-    /// The `rgba8unorm` image the compute pass writes. Recreated on resize.
+    /// The image the compute pass writes. Recreated on resize.
     storage_texture: wgpu::Texture,
-    /// Storage-narrowed view, for the compute pass's write-only image.
+    /// Storage-narrowed view, for the compute pass.
     storage_view: wgpu::TextureView,
-    /// Sampled-narrowed view, for the blit pass's `texture_2d<f32>`.
+    /// Sampled-narrowed view, handed to egui.
     sampled_view: wgpu::TextureView,
-    /// Storage view + uniform, for the compute pass.
+    /// Uniform + storage view, for the compute pass.
     compute_bind_group: wgpu::BindGroup,
-    /// Sampled view + sampler, for the blit pass.
-    blit_bind_group: wgpu::BindGroup,
-    /// Linear, clamped sampler. Linear filtering is what makes the blit
-    /// resample gracefully if the swap-chain size and the intermediate size ever
-    /// disagree by a pixel; clamping stops the fullscreen triangle's overshoot
-    /// from wrapping to the opposite edge.
-    sampler: wgpu::Sampler,
+
+    /// Size of the image, `(width, height)`, in physical pixels, clamped to at
+    /// least `1x1`.
+    size: (u32, u32),
+    /// egui's handle for [`Renderer::sampled_view`].
+    ///
+    /// `None` until the first [`Renderer::render`], and reset to `None` by
+    /// [`Renderer::resize`] so the next frame re-registers. Caching matters:
+    /// `register_native_texture` allocates a fresh `TextureId` and a fresh
+    /// bind group on every call, so calling it per frame would leak one of each
+    /// per frame.
+    registered: Option<egui::TextureId>,
 
     /// Two timestamp slots, present only after [`Renderer::enable_timestamps`]
     /// succeeds. Slot 0 is the start of the compute pass, slot 1 the end.
     timestamp_query_set: Option<wgpu::QuerySet>,
-    /// Destination for `resolve_query_set` and the CPU-side map of those
+    /// Resolve target for `resolve_query_set`, and the CPU-side map of those
     /// results. Created together with the query set.
     timestamp_readback: Option<wgpu::Buffer>,
     /// Shared with the `map_async` callback; see [`TimestampState`].
@@ -370,161 +447,51 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Requests an adapter and device, configures the surface, and builds both
-    /// pipelines.
+    /// Builds the compute pipeline against **eframe's** device and queue.
     ///
-    /// `window` is the [`egui::ViewportBuilder`] the host window was created
-    /// from; it is consulted only for the initial logical size, which gives the
-    /// swap chain a sane geometry before the first resize event arrives. The
-    /// `surface` is expected to have been created from the same window.
+    /// `state` is what [`eframe::CreationContext::wgpu_render_state`] hands back.
+    /// Nothing is requested, awaited or configured here: eframe has already
+    /// chosen an adapter, created the device and queue, and configured its
+    /// surface. In particular this function is **not** `async` — there is no
+    /// adapter request to await, so there is no executor requirement and no
+    /// reason for the app layer to block on anything.
+    ///
+    /// # The initial image is 1x1
+    ///
+    /// There is no window here to measure, so the image starts at `1x1`, which
+    /// is a valid texture and a valid one-pixel plot. **The app layer must call
+    /// [`Renderer::resize`] before the first [`Renderer::render]`** — in practice
+    /// it does this on the very first frame, because the central panel's
+    /// `available_rect` is the natural source for the pixel count. Until it
+    /// does, the plot is a single pixel.
     ///
     /// # Errors
     ///
-    /// Returns [`RendererError::NoAdapter`] if no GPU is usable,
-    /// [`RendererError::UnsupportedSurface`] if the surface and adapter are
-    /// incompatible, and [`RendererError::DeviceRequest`] if the adapter
-    /// refuses the device. No `unwrap` is reached: every fallible step below is
-    /// either a `Result` or a documented non-fallible wgpu operation.
-    pub async fn new(
-        window: &egui::ViewportBuilder,
-        surface: Arc<wgpu::Surface<'static>>,
-    ) -> Result<Self, RendererError> {
-        // `Backends::all()` rather than naming Metal/Vulkan/DX12: wgpu already
-        // filters to backends that were compiled in for this target, so this
-        // stays correct on a machine we did not anticipate.
-        //
-        // `display: None` is right for us even though winit normally supplies
-        // one. The only consumer of a display handle is GLES/Wayland surface
-        // creation, and eframe hands us an already-created `wgpu::Surface`
-        // instead of asking us to build one. On Metal, Vulkan and DX12 the field
-        // is documented as unused.
-        let descriptor = wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            display: None,
-        };
-        // `with_env` lets `WGPU_BACKEND` / `WGPU_ADAPTER_NAME` override the
-        // defaults, so a bug report about the wrong backend can be reproduced
-        // on a different one without a rebuild.
-        let instance = wgpu::Instance::new(descriptor.with_env());
+    /// Returns [`RendererError::UnusableRenderState`] if the state does not
+    /// describe a live adapter, and [`RendererError::PipelineCreation`] if the
+    /// shader and the bind group layout disagree.
+    ///
+    /// wgpu's own validation runs asynchronously and is not visible in either
+    /// variant: a WGSL compile error surfaces through the uncaptured-error
+    /// handler installed below, which prints to stderr rather than panicking. A
+    /// panic from inside pipeline creation would take the whole window down and
+    /// print a backtrace nobody reads.
+    pub fn new(state: &egui_wgpu::RenderState) -> Result<Self, RendererError> {
+        // Cloning `Device`/`Queue` bumps a refcount; there is no second
+        // physical device and no separate resource namespace.
+        let device = state.device.clone();
+        let queue = state.queue.clone();
+        let egui_renderer = Arc::clone(&state.renderer);
 
-        // `compatible_surface` is what lets wgpu reject adapters that cannot
-        // present to *this* window. Passing it is the difference between a
-        // clean "no adapter" error and a crash later inside the swap chain.
-        // The surface is only borrowed for the duration of the request, so the
-        // `Arc` is not captured.
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&*surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
-            .await
-            .map_err(|e| RendererError::NoAdapter {
-                cause: e.to_string(),
-            })?;
+        let adapter_info = state.adapter.get_info();
+        let adapter_list = describe_adapters(state);
 
-        let adapter_info = adapter.get_info();
-
-        // Ask for `TIMESTAMP_QUERY` *only* if this adapter actually has it.
-        // Device features are immutable after `request_device`, so this is the
-        // one and only chance to opt in; conversely, requesting a feature the
-        // adapter lacks makes the whole device request fail, which would take
-        // the renderer down on a machine that could otherwise run fine. Gate on
-        // the capability and the request stays safe everywhere.
-        let wants_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let required_features = if wants_timestamps {
-            wgpu::Features::TIMESTAMP_QUERY
-        } else {
-            wgpu::Features::empty()
-        };
-
-        // `request_device` hands back `(Device, Queue)` in wgpu 30; there is no
-        // separate `adapter.get_queue()` any more.
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("steel-pulse:device"),
-                required_features,
-                required_limits: wgpu::Limits::default(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                // Tracing writes every wgpu call to a directory; off unless
-                // someone is actively debugging the driver interface.
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .map_err(|e| RendererError::DeviceRequest {
-                cause: e.to_string(),
-            })?;
-
-        // Install an uncaptured-error handler. wgpu's default already panics, but
-        // a panic from deep inside a render pass takes the window down with it
-        // and prints a backtrace nobody reads. Routing validation and
-        // out-of-memory errors to stderr keeps the app alive and makes the
-        // message findable in a log.
-        device.on_uncaptured_error(std::sync::Arc::new(|error| {
+        // Validation and out-of-memory errors are reported rather than fatal, so
+        // a mis-sized texture or a binding mismatch degrades to a black plot
+        // with a readable message instead of a dead window.
+        device.on_uncaptured_error(Arc::new(|error| {
             eprintln!("steel-pulse: wgpu error: {error}");
         }));
-
-        let capabilities = surface.get_capabilities(&adapter);
-        let surface_format =
-            *capabilities
-                .formats
-                .first()
-                .ok_or_else(|| RendererError::UnsupportedSurface {
-                    cause: "the surface reports no presentable texture formats".to_owned(),
-                })?;
-
-        // The requested logical size is only a starting guess: a window that has
-        // not been shown yet, or one that is minimised, can report zero. Clamp
-        // before it reaches `Surface::configure`, which documents a zero
-        // dimension as a panic.
-        let initial = window
-            .inner_size
-            .unwrap_or(egui::emath::Vec2::new(1280.0, 720.0));
-        // `as u32` on a negative or NaN float saturates to 0 in Rust, so the
-        // `max(1)` is doing real work for a malformed builder, not just for a
-        // minimised window.
-        let width = (initial.x as u32).max(1);
-        let height = (initial.y as u32).max(1);
-
-        let config = wgpu::SurfaceConfiguration {
-            // The blit pass renders into the swap-chain image, and nothing
-            // else. Requesting COPY_SRC/COPY_DST here would make wgpu build a
-            // slower, copy-capable swap chain for no benefit.
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width,
-            height,
-            // `AutoVsync` rather than `Fifo`: wgpu documents `Immediate` and
-            // `Mailbox` as *crashing* when unsupported, and `AutoVsync`
-            // degrades gracefully to `Fifo` instead. For an interactive plotter
-            // we want vsync (no tearing, no spinning the CPU flat out when the
-            // plot is static), and we want the degrade path rather than a hard
-            // failure on an exotic compositor.
-            present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: DESIRED_MAX_FRAME_LATENCY,
-            // `Auto` lets the OS pick: opaque on a normal desktop window, and
-            // premultiplied where the compositor wants that. The blit writes
-            // alpha 1.0 in the shader, so the window is fully opaque either
-            // way and the choice costs nothing.
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            // The wgpu 30 alias is `SurfaceConfiguration<Vec<TextureFormat>>`;
-            // an owned empty vec means "no alternate srgb views".
-            view_formats: Vec::new(),
-        };
-
-        surface.configure(&device, &config);
-
-        // -------------------------------------------------------------------
-        // Bind group layouts. Explicit, because an explicit layout turns a
-        // shader-side mistake into a pipeline-creation error instead of a
-        // picture that is subtly wrong.
-        // -------------------------------------------------------------------
 
         let compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("steel-pulse:compute:bgl"),
@@ -537,8 +504,11 @@ impl Renderer {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        // Pinning the size lets wgpu validate against the
-                        // WGSL struct's minimum binding size at layout time.
+                        // Pinning the size lets wgpu validate the binding against
+                        // the WGSL struct's minimum binding size at layout time,
+                        // which is how a field-count mismatch between
+                        // `src/uniforms.rs` and the shader gets caught at
+                        // startup rather than as a mis-coloured plot.
                         min_binding_size: wgpu::BufferSize::new(UNIFORM_BUFFER_SIZE),
                     },
                     count: None,
@@ -556,126 +526,43 @@ impl Renderer {
             ],
         });
 
-        let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("steel-pulse:blit:bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        // `filterable: true` pairs with the linear sampler
-                        // below and with a plain unorm format, which is always
-                        // filterable. Getting this wrong while using a
-                        // `Filtering` sampler is a validation error.
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
-        // -------------------------------------------------------------------
-        // Pipelines.
-        //
-        // The shader modules are created with `create_shader_module`, which in
-        // wgpu 30 runs Naga's frontend and reports WGSL syntax errors through
-        // the uncaptured-error handler installed above. Note also that in this
-        // version `compilation_options` lives on the per-stage state, not on the
-        // pipeline descriptor, and the `cache` field is `None` (no on-disk
-        // pipeline cache: it would need a Cargo feature we do not enable).
-        // -------------------------------------------------------------------
-
-        let compute_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        // `create_shader_module` in wgpu 30 runs Naga's WGSL front-end; syntax
+        // errors are reported through the uncaptured-error handler above rather
+        // than returned here, which is why `PipelineCreation` mostly surfaces
+        // layout and entry-point mismatches.
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("steel-pulse:domain_coloring"),
             source: wgpu::ShaderSource::Wgsl(COMPUTE_SHADER_SRC.into()),
         });
 
-        let compute_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("steel-pulse:compute:pl"),
-                bind_group_layouts: &[Some(&compute_layout)],
-                // No push-constant-style immediate data; the uniforms go
-                // through the uniform buffer so they survive across passes.
-                immediate_size: 0,
-            });
-
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("steel-pulse:domain_coloring:compute"),
-            layout: Some(&compute_pipeline_layout),
-            module: &compute_module,
-            entry_point: Some(COMPUTE_ENTRY_POINT),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-
-        let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("steel-pulse:blit"),
-            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER_SRC.into()),
-        });
-
-        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("steel-pulse:blit:pl"),
-            bind_group_layouts: &[Some(&blit_layout)],
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("steel-pulse:compute:pl"),
+            bind_group_layouts: &[Some(&compute_layout)],
+            // No push-constant-style immediate data. The uniforms go through the
+            // uniform buffer so they are addressable by the shader rather than
+            // baked into the pipeline, which is what makes them changeable per
+            // frame at all.
             immediate_size: 0,
         });
 
-        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("steel-pulse:blit:render"),
-            layout: Some(&blit_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &blit_module,
-                entry_point: Some(BLIT_VERTEX_ENTRY_POINT),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                // No vertex buffers: positions come from `vertex_index`.
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                // The triangle is wound counter-clockwise in clip space but the
-                // projection flips Y, so it arrives clockwise. Culling is off
-                // anyway, so winding is irrelevant — but being explicit means
-                // the back-face cull setting cannot drift.
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                ..Default::default()
-            },
-            // No depth buffer: this is a single full-screen draw and there is
-            // nothing to occlude.
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &blit_module,
-                entry_point: Some(BLIT_FRAGMENT_ENTRY_POINT),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    // Opaque output. Alpha is meaningless for a plot, and
-                    // `CompositeAlphaMode::Auto` will composite the window as
-                    // opaque regardless, so blending would only cost bandwidth.
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("steel-pulse:domain_coloring:compute"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(COMPUTE_ENTRY_POINT),
+            // Pass-through is right here: naga's own front-end already runs on
+            // this machine, and a second front-end would add a compile-time
+            // feature dependency for no benefit.
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            // No on-disk pipeline cache: that needs a Cargo feature this crate
+            // does not enable.
             cache: None,
         });
 
-        // -------------------------------------------------------------------
-        // Per-frame resources.
-        // -------------------------------------------------------------------
-
-        // `mapped_at_creation` would let us seed it without a queue write, but
+        // `mapped_at_creation` would let us seed this without a queue write, but
         // an all-zero uniform is a perfectly good starting state and the first
-        // frame overwrites it anyway. COPY_DST is the only usage strictly
-        // required, and the narrowest one that validates.
+        // frame overwrites it anyway. `COPY_DST` is the only other usage
+        // `write_buffer` strictly requires, and the narrowest one that validates.
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("steel-pulse:uniforms"),
             size: UNIFORM_BUFFER_SIZE,
@@ -683,178 +570,160 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("steel-pulse:blit:sampler"),
-            // Clamp on every axis: the fullscreen triangle samples slightly
-            // outside `[0, 1]` at its third vertex, and a repeat or mirror
-            // address mode would drag the far edge of the plot into view.
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let target = build_storage_target(
-            &device,
-            &compute_layout,
-            &blit_layout,
-            &uniform_buffer,
-            &sampler,
-            width,
-            height,
-        );
+        // 1x1 until the app layer reports the real size. Valid, and cheap.
+        let size = (1u32, 1u32);
+        let target =
+            build_storage_target(&device, &compute_layout, &uniform_buffer, size.0, size.1);
 
         Ok(Self {
             device,
             queue,
+            egui_renderer,
             adapter_info,
-            surface,
-            config,
-            size: (width, height),
+            adapter_list,
             compute_pipeline,
             compute_layout,
-            blit_pipeline,
-            blit_layout,
             uniform_buffer,
             storage_texture: target.texture,
             storage_view: target.storage_view,
             sampled_view: target.sampled_view,
             compute_bind_group: target.compute_bind_group,
-            blit_bind_group: target.blit_bind_group,
-            sampler,
+            size,
+            registered: None,
             timestamp_query_set: None,
             timestamp_readback: None,
             timestamp_state: Arc::new(Mutex::new(TimestampState::default())),
         })
     }
 
-    /// Notifies the renderer that the drawable area changed size.
+    /// Notifies the renderer that its drawable area changed size.
     ///
-    /// Reconfigures the surface and, when the size genuinely changed,
-    /// **recreates the storage texture and both bind groups**. That
-    /// recreation is not optional: a bind group captures the view it was built
-    /// from, so once the texture is replaced the old bind groups reference a
-    /// texture that no longer exists. Recreating them is the only correct
-    /// response, and it is cheap — three small objects, once per resize.
+    /// Rebuilds the storage texture, both views, and the compute bind group, and
+    /// **invalidates the cached egui registration** so the next
+    /// [`Renderer::render`] re-registers. That last part is not optional: egui's
+    /// bind group holds a reference to the old view, and once this function
+    /// replaces the texture that view is destroyed. Leaving the old
+    /// [`RenderOutcome::texture`] in place would leave the app drawing through a
+    /// bind group that points at freed memory.
     ///
     /// Sizes are clamped to `1x1`. A minimised window legitimately reports
-    /// `0x0`, and both `create_texture` and `Surface::configure` treat a zero
-    /// dimension as a validation error (and, for `configure`, a documented
-    /// panic) rather than as something to skip. Clamping keeps the renderer
+    /// `0x0`, and a `0x0` `create_texture` is a validation error that poisons the
+    /// device rather than something to skip, so clamping keeps the renderer
     /// alive across a minimise/restore cycle without a special case at every
     /// call site.
+    ///
+    /// Returns early when the size is unchanged. egui emits resize events for
+    /// sub-pixel and HiDPI changes that do not alter the pixel count, and
+    /// reallocating the image on those would be pure waste.
+    ///
+    /// # Which pixel count to pass
+    ///
+    /// The plot's physical size, and **only** the plot's physical size. The
+    /// image is sampled by egui into a UI rectangle, so the right argument is
+    /// that rectangle's size in physical pixels — the central panel's
+    /// `available_rect` times the viewport's `pixels_per_point` — not the window
+    /// size and not the value in logical points. Getting this wrong stretches or
+    /// crops the plot even though nothing errors.
+    ///
+    /// eframe owns the surface, so unlike a self-presenting renderer this
+    /// function reconfigures nothing: no swap chain, no `SurfaceConfiguration`,
+    /// no `present`. It only has to agree with eframe about how big the plot is.
     pub fn resize(&mut self, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
 
-        // Nothing to do if the size is unchanged: egui emits a resize event
-        // for sub-pixel and HiDPI changes that do not alter the pixel count,
-        // and reallocating the image on those would be pure waste.
         if (width, height) == self.size {
             return;
         }
 
+        // Release egui's handle on the view we are about to destroy. Without
+        // this, every resize would leave a dead bind group in egui's texture
+        // map, and the map would grow without bound over a session with many
+        // window drags.
+        self.unregister();
+
         self.size = (width, height);
-        self.config.width = width;
-        self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
-        self.recreate_storage_target();
+        let target = build_storage_target(
+            &self.device,
+            &self.compute_layout,
+            &self.uniform_buffer,
+            width,
+            height,
+        );
+        // Assigning the texture last is deliberate: the new bind group is
+        // already valid by the time this runs, so the renderer is never
+        // momentarily missing a binding.
+        self.compute_bind_group = target.compute_bind_group;
+        self.storage_view = target.storage_view;
+        self.sampled_view = target.sampled_view;
+        self.storage_texture = target.texture;
     }
 
-    /// Renders one frame into the swap chain.
+    /// Uploads the uniforms, runs the compute pass, and makes the result
+    /// available to egui.
     ///
-    /// `target` is the [`egui::TextureId`] the caller intends to display. egui
-    /// hands the app a `TextureId::Managed(_)` for anything it owns — the font
-    /// atlas above all — and such a frame is not addressed at a real GPU
-    /// surface, so all GPU work is skipped and the call returns immediately.
-    /// Only [`egui::TextureId::User`], which is what a `TextureOptions`/
-    /// `egui::TextureManager` registration for the plot produces, actually
-    /// drives a frame.
+    /// This is the whole frame. It does not draw anything itself: the compute
+    /// pass fills an off-screen image, and egui's own renderer blits that image
+    /// to the window later in the same frame, as part of the ordinary UI paint.
+    /// That is what makes this renderer work inside eframe at all — eframe owns
+    /// the swap chain and will present whatever its renderer produced.
     ///
-    /// This is a best-effort operation and reports nothing: a dropped frame is
-    /// a normal outcome, not an error. The surface legitimately refuses to hand
-    /// out an image when the window is occluded, minimised, or mid-resize, and
-    /// the correct response to all of those is "skip this frame and try again",
-    /// which is what the `None` arms below do.
-    /// # The `uniforms.resolution` contract
+    /// # The `resolution` contract
     ///
-    /// The kernel bounds-checks every invocation against
-    /// `uniforms.resolution`, but `textureStore`s at its own integer pixel
-    /// coordinate in an image of `self.size()`. Those two numbers **must** be
-    /// equal. If the uniform is larger, the shader's own bounds check admits
-    /// invocations that store past the end of the image — an out-of-bounds
-    /// write, which is undefined behaviour rather than a dropped pixel. If it
-    /// is smaller, the right and bottom edges of the plot are simply never
-    /// written and keep stale contents.
+    /// `uniforms.resolution` **must** equal [`RenderOutcome::size`] exactly, in
+    /// physical pixels. The kernel bounds-checks its dispatch against the
+    /// uniform but `textureStore`s into an image of `size()`:
     ///
-    /// So the caller should set `uniforms.resolution` from
-    /// [`Renderer::size`], in **physical pixels** — not from egui's logical
-    /// points, and not from the central panel's `available_size`, which is a
-    /// different rectangle from the window surface. On a Retina display those
-    /// differ by the pixel scale; the window surface is the authority.
+    /// * uniform larger than the image — the shader's own bounds check admits
+    ///   invocations that store past the end of the texture, which is undefined
+    ///   behaviour rather than a dropped pixel;
+    /// * uniform smaller — the right and bottom edges are never written and keep
+    ///   stale contents, which during a resize is a visible smear of the old
+    ///   plot.
     ///
-    /// This function deliberately does *not* overwrite the field to "fix" a
+    /// This function deliberately does **not** overwrite the field to "fix" a
     /// mismatch. Silently substituting a different resolution would shift every
-    /// plot's mapping and hide the disagreement that caused it, which is a far
-    /// worse failure than an obvious one.
-    pub fn render(&mut self, uniforms: &Uniforms, target: &egui::TextureId) {
-        // egui repaint semantics: a headless or hidden frame has no drawable
-        // to present to. Checking this *before* touching the uniform buffer
-        // also means a hidden window does not keep the queue busy with uploads.
-        let egui::TextureId::User(_) = target else {
-            return;
-        };
-
+    /// plot's mapping and hide the disagreement that caused it, which is much
+    /// worse than an obvious failure. Set the field from [`Renderer::size`].
+    ///
+    /// # Errors
+    ///
+    /// None. A dropped or unusable frame is a normal outcome here — egui's
+    /// renderer lock may be poisoned — and is reported through
+    /// [`RenderOutcome::texture`] rather than as an error, because there is
+    /// nothing the caller could do about it mid-frame.
+    pub fn render(&mut self, uniforms: &Uniforms) -> RenderOutcome {
         // `bytemuck::cast_slice` on a one-element array borrows a temporary
-        // array, which is fine: `write_buffer` copies immediately and the
-        // borrow does not outlive the statement.
+        // array, which is fine: `write_buffer` copies immediately and the borrow
+        // does not outlive the statement.
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[*uniforms]));
 
-        let surface_texture = match self.acquire_surface_texture() {
-            Some(texture) => texture,
-            None => return,
-        };
+        let size = self.size;
+        let (width, height) = size;
 
-        let target_view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor {
-                label: Some("steel-pulse:surface:view"),
-                format: None,
-                dimension: None,
-                usage: None,
-                aspect: wgpu::TextureAspect::All,
-                base_mip_level: 0,
-                mip_level_count: None,
-                base_array_layer: 0,
-                array_layer_count: None,
-            });
-
-        let (width, height) = self.size;
-
-        // Workgroup counts are rounded *up*: the shader guards each invocation
-        // with a bounds check, so the overhang of the last workgroup in each
-        // axis is discarded on the GPU rather than clamped on the CPU. Rounding
-        // down instead would leave the right and bottom edges of the plot
-        // unrendered after any non-multiple-of-8 resize.
+        // Round the workgroup count *up* in each axis. The kernel guards every
+        // invocation with a bounds check, so the overhang of the last workgroup
+        // is discarded on the GPU rather than clamped on the CPU. Rounding down
+        // would leave the right and bottom edges unrendered after any resize
+        // that is not a multiple of the workgroup size.
         let groups_x = width.div_ceil(WORKGROUP_SIZE);
         let groups_y = height.div_ceil(WORKGROUP_SIZE);
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("steel-pulse:frame"),
+                label: Some("steel-pulse:plot"),
             });
 
-        // -- Pass 1: evaluate the function, one invocation per texel. --------
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("steel-pulse:domain_coloring:pass"),
-                // Only written when timing is on; `None` otherwise so the
-                // pass costs exactly what it costs without instrumentation.
+                // Only written when timing is on. `None` otherwise, so the pass
+                // costs exactly what it costs without instrumentation. A
+                // pass-level timestamp write needs `Features::TIMESTAMP_QUERY`
+                // and *not* the non-default `TIMESTAMP_QUERY_INSIDE_ENCODERS`,
+                // which is only for writing timestamps on the encoder itself.
                 timestamp_writes: self.timestamp_query_set.as_ref().map(|query_set| {
                     wgpu::ComputePassTimestampWrites {
                         query_set,
@@ -869,68 +738,43 @@ impl Renderer {
             compute_pass.dispatch_workgroups(groups_x, groups_y, 1);
         }
 
-        // -- Pass 2: blit the result onto the swap-chain image. ---------------
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("steel-pulse:blit:pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target_view,
-                    // A 2D view, so no depth slice.
-                    depth_slice: None,
-                    // No MSAA, so nothing to resolve into.
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        // The blit covers every pixel of the triangle, so
-                        // clearing is pure cost. `LoadOp::Clear` is kept anyway
-                        // as a cheap guard against a driver that leaves
-                        // undefined content at the triangle's clipped
-                        // overhang on some platforms.
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            render_pass.set_pipeline(&self.blit_pipeline);
-            render_pass.set_bind_group(0, &self.blit_bind_group, &[]);
-            render_pass.draw(0..FULLSCREEN_TRIANGLE_VERTICES, 0..1);
-        }
-
-        // In wgpu 30 timestamps live on the pass descriptors, so the resolve has
-        // to happen in a *later* submission than the pass that wrote them. It
-        // is encoded here rather than in `resolve_timestamps` so the copy is
-        // queued in the same breath as the frame that produced it.
-        if let (Some(query_set), Some(readback)) = (
-            self.timestamp_query_set.as_ref(),
-            self.timestamp_readback.as_ref(),
-        ) {
-            encoder.resolve_query_set(query_set, 0..2, readback, 0);
-        }
-
         self.queue.submit(std::iter::once(encoder.finish()));
-        // wgpu 30 moved presentation off `SurfaceTexture::present` and onto the
-        // queue, because the queue is what owns the submission the present must
-        // be ordered against. Forgetting this makes the image appear one frame
-        // late and then stall.
-        self.queue.present(surface_texture);
+
+        // The query resolve goes in its own submission rather than at the tail of
+        // the frame's command buffer. wgpu-core does track query-set writes and
+        // would accept either, but a separate submit is unambiguous under every
+        // reading of the spec and costs nothing here, because this whole block
+        // only exists when the app layer opted in to timing.
+        self.encode_timestamp_resolve();
+
+        let texture = self.ensure_registered();
+        let gpu_ms = self.resolve_timestamps_ms();
+
+        RenderOutcome {
+            texture,
+            size,
+            gpu_ms,
+        }
+    }
+
+    /// Current image size, `(width, height)`, in physical pixels.
+    ///
+    /// This is the value to copy into `uniforms.resolution`; see the module
+    /// documentation for why getting it wrong is undefined behaviour rather
+    /// than a cosmetic error.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
     }
 
     /// A one-line description of the GPU stack, for the UI's status bar.
     ///
-    /// Built from the real [`wgpu::AdapterInfo`] rather than from a compile-time
-    /// constant, so it reflects the adapter wgpu actually handed us — which is
-    /// the only thing a bug report actually needs. `Backend` and `DeviceType`
-    /// implement neither `Display` nor a lowercase name, so they are formatted
-    /// explicitly.
+    /// Built from the real [`wgpu::AdapterInfo`] captured at construction rather
+    /// than from a compile-time constant, so it reflects the adapter eframe
+    /// actually selected — which is the only thing a bug report needs. Reads as
+    /// `"wgpu 30.0.1 / Metal / Apple M-series"`.
+    ///
+    /// `Backend` and `DeviceType` implement neither `Display` nor a lowercase
+    /// name, so they are spelled out explicitly.
     pub fn backend_description(&self) -> String {
         format!(
             "wgpu {WGPU_VERSION_LABEL} / {} / {}",
@@ -939,31 +783,69 @@ impl Renderer {
         )
     }
 
+    /// Every adapter wgpu could see at startup, one per line, for the UI's
+    /// diagnostics block.
+    ///
+    /// Rendered once in [`Renderer::new`] and cached as a string: the list cannot
+    /// change while the process runs, and the value is only ever read to paint
+    /// a read-only panel. Returns `"<none reported>"` on targets where eframe
+    /// does not publish the list, which today means only wasm.
+    pub fn adapter_summary(&self) -> String {
+        self.adapter_list.clone()
+    }
+
     /// The uniform buffer, for tests and for debug tooling that wants to read
     /// back what the last frame uploaded.
     pub fn uniform_buffer(&self) -> &wgpu::Buffer {
         &self.uniform_buffer
     }
 
-    /// Current intermediate-image size, `(width, height)`, in physical pixels.
-    pub fn size(&self) -> (u32, u32) {
-        self.size
-    }
-
     /// Tries to turn on GPU timing for the compute pass.
     ///
-    /// Returns `true` if timing is now available. This is a *real* capability
-    /// check, not a stub: [`Renderer::new`] already requested
-    /// [`wgpu::Features::TIMESTAMP_QUERY`] if and only if the adapter advertised
-    /// it, and creating a two-slot `QueryType::Timestamp` set is unconditionally
-    /// valid for a device holding that feature, so no speculative creation (and
-    /// no error scope) is needed here.
+    /// Returns `true` if timing is now available.
     ///
-    /// Calling this on a device without the feature is not an error; it just
-    /// returns `false` and [`Renderer::resolve_timestamps`] keeps returning
-    /// `None`. `Features::TIMESTAMP_QUERY` is an ordinary device feature
-    /// available in a default wgpu build — it needs no Cargo feature flag, which
-    /// is why this is a runtime check rather than a `compile_error!`.
+    /// # This returns `false` with a default eframe configuration
+    ///
+    /// Device features are fixed at device-creation time and immutable
+    /// afterwards. eframe's built-in `WgpuSetupCreateNew` builds its
+    /// `DeviceDescriptor` with `..Default::default()`, and `Default` for
+    /// `required_features` is `Features::empty()` — so **eframe does not request
+    /// `TIMESTAMP_QUERY`**, and this returns `false` unless the app layer
+    /// supplies its own device descriptor. This is not faked and not worked
+    /// around: a `QuerySet` cannot be created on a device that lacks the
+    /// feature, and `RenderOutcome::gpu_ms` stays `None`.
+    ///
+    /// The app layer can enable it by overriding the descriptor on the way into
+    /// eframe, which must happen **before** `App::new`:
+    ///
+    /// ```ignore
+    /// let mut options = eframe::NativeOptions { ..Default::default() };
+    /// let ef::egui_wgpu::WgpuSetup::CreateNew(mut create_new) =
+    ///     ef::egui_wgpu::WgpuSetup::without_display_handle()
+    /// else {
+    ///     unreachable!("eframe's own default is WgpuSetup::CreateNew");
+    /// };
+    /// create_new.device_descriptor = std::sync::Arc::new(|adapter: &wgpu::Adapter| {
+    ///     wgpu::DeviceDescriptor {
+    ///         required_features: wgpu::Features::TIMESTAMP_QUERY,
+    ///         // Mirrors egui-wgpu's own default, which caps the 2D texture
+    ///         // dimension so a 4k+ surface fits.
+    ///         required_limits: wgpu::Limits {
+    ///             max_texture_dimension_2d: 8192,
+    ///             ..wgpu::Limits::default()
+    ///         },
+    ///         ..Default::default()
+    ///     }
+    /// });
+    /// options.wgpu_options.wgpu_setup =
+    ///     ef::egui_wgpu::WgpuSetup::CreateNew(create_new);
+    /// ```
+    ///
+    /// Requesting the feature unconditionally would be wrong in the other
+    /// direction: `request_device` *fails* when asked for a feature the adapter
+    /// lacks, so a hard request would stop the app from starting on a machine
+    /// that could otherwise run it perfectly well. The feature check here is the
+    /// honest version of that gate, applied as late as the immutable API allows.
     pub fn enable_timestamps(&mut self) -> bool {
         if self.timestamp_query_set.is_some() {
             return true;
@@ -976,6 +858,9 @@ impl Renderer {
             return false;
         }
 
+        // A two-slot `QueryType::Timestamp` set is unconditionally valid for a
+        // device holding the feature, so no speculative creation and no error
+        // scope is needed.
         self.timestamp_query_set = Some(self.device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("steel-pulse:timestamps"),
             ty: wgpu::QueryType::Timestamp,
@@ -983,9 +868,9 @@ impl Renderer {
         }));
 
         // `QUERY_RESOLVE` and `MAP_READ` on one buffer lets the resolve target be
-        // mapped directly, with no staging copy. Resolution writes 8 bytes per
-        // query with an offset aligned to `QUERY_RESOLVE_BUFFER_ALIGNMENT`; the
-        // buffer is sized and aligned to match.
+        // mapped directly, with no staging copy. Resolution writes
+        // `QUERY_SIZE` bytes per query at an offset aligned to
+        // `QUERY_RESOLVE_BUFFER_ALIGNMENT`; offset 0 and this size satisfy both.
         self.timestamp_readback = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("steel-pulse:timestamps:readback"),
             size: 2 * TIMESTAMP_QUERY_BYTES,
@@ -1002,35 +887,106 @@ impl Renderer {
         true
     }
 
-    /// Returns the most recent GPU duration measured for the compute pass.
+    // -----------------------------------------------------------------------
+    // Internals
+    // -----------------------------------------------------------------------
+
+    /// Registers [`Renderer::sampled_view`] with egui if it is not already, and
+    /// returns the handle.
     ///
-    /// Deliberately **non-blocking**. The readback is a map of a buffer the GPU
-    /// wrote a frame or two ago; waiting on it with `PollType::Wait` would
-    /// serialise CPU and GPU and throw away the double buffering the frame
-    /// latency of 2 exists to provide. So this kicks off at most one readback at
-    /// a time, gives the callback a single non-blocking poll to run, and
-    /// returns whatever the previous readback produced — which is a frame stale
-    /// and therefore useless for synchronisation, but exactly right for
-    /// telemetry.
+    /// Registration allocates a fresh [`egui::TextureId`] and a fresh bind group
+    /// inside egui's renderer, so it happens once per texture — that is, the
+    /// first frame after construction and the first frame after each
+    /// [`Renderer::resize`] — and never again. Calling it per frame would leak
+    /// one texture-id slot and one bind group per frame.
     ///
-    /// Returns `None` when timing was never enabled, when the device lacks the
-    /// feature, or when no readback has completed yet.
-    pub fn resolve_timestamps(&mut self) -> Option<Duration> {
+    /// The lock is held for the duration of a bind-group allocation and nothing
+    /// else: no GPU work, no allocation of the image, no blocking wait. That
+    /// matters because eframe takes the same lock while painting, and because
+    /// epaint's `RwLock` has a debug-build deadlock detector that panics rather
+    /// than waiting indefinitely.
+    ///
+    /// The lock cannot be poisoned — `epaint::mutex::RwLock` wraps
+    /// `parking_lot`, which has no poisoning state — so this cannot fail and
+    /// always returns `Some`. The lock is not held across any call that can
+    /// panic, so a deadlock here is not reachable either.
+    fn ensure_registered(&mut self) -> Option<egui::TextureId> {
+        if let Some(id) = self.registered {
+            return Some(id);
+        }
+
+        let mut egui_renderer = self.egui_renderer.write();
+        let id = egui_renderer.register_native_texture_with_sampler_options(
+            &self.device,
+            &self.sampled_view,
+            PLOT_SAMPLER,
+        );
+        drop(egui_renderer);
+
+        self.registered = Some(id);
+        Some(id)
+    }
+
+    /// Asks egui to drop its handle on the current view, so the bind group
+    /// referencing it can be collected before the texture is replaced.
+    fn unregister(&mut self) {
+        let Some(id) = self.registered.take() else {
+            return;
+        };
+        // egui stores `texture: None` for natively-registered textures, so this
+        // releases the bind group and leaves our `wgpu::Texture` alone for the
+        // caller to drop. The write guard is scoped tightly for the same reason
+        // as in `ensure_registered`.
+        self.egui_renderer.write().free_texture(&id);
+    }
+
+    /// Encodes and submits the query-set resolve for this frame's compute pass.
+    ///
+    /// A no-op unless timestamps are enabled. Kept separate from
+    /// [`Renderer::render`]'s command buffer so the resolve is unambiguously
+    /// ordered after the pass that wrote the queries.
+    fn encode_timestamp_resolve(&self) {
+        let (Some(query_set), Some(readback)) = (
+            self.timestamp_query_set.as_ref(),
+            self.timestamp_readback.as_ref(),
+        ) else {
+            return;
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("steel-pulse:timestamps:resolve"),
+            });
+        encoder.resolve_query_set(query_set, 0..2, readback, 0);
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Decodes the most recent GPU duration for the compute pass, in
+    /// milliseconds, initiating at most one readback at a time.
+    ///
+    /// Deliberately **non-blocking**. The readback maps a buffer the GPU wrote a
+    /// frame or two ago; waiting on it with `PollType::Wait` would serialise CPU
+    /// and GPU and destroy the pipelining that a plot this size depends on. So
+    /// this kicks off at most one readback at a time, gives the callback a single
+    /// non-blocking poll to run, and returns whatever the previous readback
+    /// produced — a frame stale, and therefore useless for synchronisation but
+    /// exactly right for telemetry.
+    fn resolve_timestamps_ms(&mut self) -> Option<f64> {
         let readback = self.timestamp_readback.clone()?;
 
         {
             let mut state = lock_timestamps(&self.timestamp_state);
             if state.in_flight {
-                // A readback is outstanding; report the last decoded value
-                // rather than trying to map an already-mapped buffer.
-                return state.latest;
+                // A readback is outstanding; report the last decoded value rather
+                // than trying to map a buffer that is already mapped.
+                return state.latest.map(|d| d.as_secs_f64() * 1_000.0);
             }
             state.in_flight = true;
         }
 
-        // `get_timestamp_period` converts raw query ticks to nanoseconds. It is
-        // 1.0 on the web and roughly 1.0 on most native backends, but reading
-        // it is the only correct way to do the arithmetic.
+        // Converts raw query ticks to seconds. It is 1.0 on the web and around
+        // 1.0 on most native backends, but reading it is the only correct way to
+        // do the arithmetic.
         let period = f64::from(self.queue.get_timestamp_period());
 
         let readback_for_callback = readback.clone();
@@ -1039,8 +995,8 @@ impl Renderer {
             .slice(..)
             .map_async(wgpu::MapMode::Read, move |result| {
                 let mut state = lock_timestamps(&state);
-                // Always clear the in-flight flag, even on failure, or the
-                // renderer would never attempt another readback.
+                // Always clear the in-flight flag, even on failure, or no further
+                // readback would ever be attempted.
                 state.in_flight = false;
 
                 if result.is_err() {
@@ -1049,14 +1005,17 @@ impl Renderer {
                 }
 
                 let mapped = readback_for_callback.slice(..).get_mapped_range();
-                let duration = match mapped {
+                let seconds = match mapped {
                     Ok(view) => {
-                        // Two little-endian u64s, in submission order. The
-                        // buffer is exactly two queries wide, so `chunks_exact`
-                        // yields exactly two words and anything malformed shows
-                        // up as a short iterator rather than as a panic.
-                        let mut words = view.chunks_exact(8).map(|w| {
-                            u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]])
+                        // Two little-endian u64s in submission order. The buffer
+                        // is exactly two queries wide, so `chunks_exact` yields
+                        // exactly two words and anything malformed shows up as a
+                        // short iterator rather than as a panic.
+                        let mut words = view.chunks_exact(8).map(|word| {
+                            u64::from_le_bytes([
+                                word[0], word[1], word[2], word[3], word[4], word[5], word[6],
+                                word[7],
+                            ])
                         });
                         let start = words.next();
                         let end = words.next();
@@ -1066,8 +1025,13 @@ impl Renderer {
                         readback_for_callback.unmap();
 
                         match (start, end) {
+                            // `saturating_sub` rather than `checked_sub`: the
+                            // query set holds whatever the last completed frame
+                            // wrote, so a wrapped value means this frame's pass
+                            // did not run and the reading is meaningless. It is
+                            // filtered out below rather than reported.
                             (Some(start), Some(end)) => {
-                                end.checked_sub(start).map(|ticks| ticks as f64 * period)
+                                Some(end.saturating_sub(start) as f64 * period)
                             }
                             _ => None,
                         }
@@ -1075,102 +1039,44 @@ impl Renderer {
                     Err(_) => None,
                 };
 
-                match duration {
-                    // A zero-length interval means the query set was never
-                    // written this frame (for instance a frame that was skipped
-                    // because the window was occluded), not a zero-cost pass.
-                    Some(seconds) if seconds > 0.0 && seconds.is_finite() && seconds < 1.0 => {
-                        state.latest = Some(Duration::from_secs_f64(seconds));
+                match seconds {
+                    // Zero means the query set was never written this frame, not
+                    // a zero-cost pass. The upper bound rejects a nonsense value
+                    // before `Duration::from_secs_f64` can panic on it.
+                    Some(s) if s > 0.0 && s.is_finite() && s < 1.0 => {
+                        state.latest = Some(Duration::from_secs_f64(s));
                     }
                     _ => state.dropped += 1,
                 }
             });
 
-        // One non-blocking poll so a readback that already completed is decoded
-        // on this call rather than the next. `Poll` never waits, so this cannot
-        // stall the frame loop; a device error here is not actionable and is
-        // reported through the uncaptured-error handler anyway.
+        // One non-blocking poll so a readback that already completed is decoded on
+        // this call rather than the next. `Poll` never waits, so it cannot stall
+        // the frame loop. A device error here is not actionable and is reported
+        // through the uncaptured-error handler anyway.
         let _ = self.device.poll(wgpu::PollType::Poll);
 
-        lock_timestamps(&self.timestamp_state).latest
-    }
-
-    // -----------------------------------------------------------------------
-    // Internals
-    // -----------------------------------------------------------------------
-
-    /// Allocates a fresh intermediate image plus the two bind groups that read
-    /// and write it.
-    ///
-    /// Called from [`Renderer::resize`]. Not `pub`: both bind groups bake in a
-    /// `TextureView`, so this must never be reachable without also refreshing
-    /// `self.size` and the surface configuration.
-    fn recreate_storage_target(&mut self) {
-        let (width, height) = self.size;
-        let target = build_storage_target(
-            &self.device,
-            &self.compute_layout,
-            &self.blit_layout,
-            &self.uniform_buffer,
-            &self.sampler,
-            width,
-            height,
-        );
-        // Assigning the texture last is deliberate: the new bind groups are
-        // already valid by the time this runs, so the renderer is never
-        // momentarily missing a binding.
-        self.compute_bind_group = target.compute_bind_group;
-        self.blit_bind_group = target.blit_bind_group;
-        self.storage_view = target.storage_view;
-        self.sampled_view = target.sampled_view;
-        self.storage_texture = target.texture;
-    }
-
-    /// Acquires the next swap-chain image, reconfiguring if the surface has gone
-    /// stale.
-    ///
-    /// wgpu 30 replaced the old `Result<SurfaceTexture, SurfaceError>` with a
-    /// six-way enum, and four of the six arms are "do not draw this frame"
-    /// rather than "something went wrong": the window can be minimised
-    /// (`Occluded`), mid-move (`Outdated`), timed out, or the device can have
-    /// reported a validation error. Only `Success` and `Suboptimal` carry a
-    /// drawable.
-    fn acquire_surface_texture(&self) -> Option<wgpu::SurfaceTexture> {
-        match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture) => Some(texture),
-            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
-                // The image no longer matches the window (a resize raced the
-                // frame). Reconfigure now so the *next* frame is clean; this
-                // one is still drawable, so use it rather than dropping a frame.
-                self.surface.configure(&self.device, &self.config);
-                Some(texture)
-            }
-            wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded
-            | wgpu::CurrentSurfaceTexture::Outdated
-            | wgpu::CurrentSurfaceTexture::Lost
-            | wgpu::CurrentSurfaceTexture::Validation => None,
-        }
+        lock_timestamps(&self.timestamp_state)
+            .latest
+            .map(|d| d.as_secs_f64() * 1_000.0)
     }
 }
 
-/// Allocates a `width` x `height` `rgba8unorm` image and the two bind groups
-/// that reference it.
+/// Allocates a `width` x `height` `rgba8unorm` image, its two views, and the
+/// bind group that writes it.
 ///
-/// Free function rather than a method so that the constructor can build the
-/// target from local handles and `resize` can build it from `self`'s, without
+/// A free function rather than a method so [`Renderer::new`] can build the
+/// target from local handles and [`Renderer::resize`] from `self`'s, without
 /// either path needing placeholder values to satisfy struct initialisation.
 ///
-/// `width` and `height` are clamped rather than trusted. A `0x0`
-/// `create_texture` is a validation error that poisons the device, and a
-/// minimised window really does report zero, so the invariant is enforced at the
-/// one place that allocates rather than trusted from every call site.
+/// `width` and `height` are clamped rather than trusted: a `0x0` `create_texture`
+/// is a validation error that poisons the device, and a minimised window really
+/// does report zero, so the invariant is enforced at the one place that allocates
+/// rather than trusted from every call site.
 fn build_storage_target(
     device: &wgpu::Device,
     compute_layout: &wgpu::BindGroupLayout,
-    blit_layout: &wgpu::BindGroupLayout,
     uniform_buffer: &wgpu::Buffer,
-    sampler: &wgpu::Sampler,
     width: u32,
     height: u32,
 ) -> StorageTarget {
@@ -1188,16 +1094,11 @@ fn build_storage_target(
         dimension: wgpu::TextureDimension::D2,
         format: STORAGE_FORMAT,
         // `STORAGE_BINDING` for the compute pass's write-only image,
-        // `TEXTURE_BINDING` for the blit's `texture_2d<f32>`.
+        // `TEXTURE_BINDING` for egui's `texture_2d<f32>`.
         usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
 
-    // Two views of one image: the compute pass needs a write-only storage view,
-    // the blit a filterable sampled view. They are the same pixels, so nothing
-    // has to be copied between them, and because they live in different passes
-    // of one submission wgpu inserts the storage-write to texture-read barrier
-    // on its own.
     let storage_view = texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("steel-pulse:plot:storage_view"),
         format: None,
@@ -1232,8 +1133,8 @@ fn build_storage_target(
                     buffer: uniform_buffer,
                     offset: 0,
                     // `None` means "the rest of the buffer", which is exactly
-                    // `UNIFORM_BUFFER_SIZE` and stays correct if the struct
-                    // ever grows.
+                    // `UNIFORM_BUFFER_SIZE` and stays correct if the struct ever
+                    // grows.
                     size: None,
                 }),
             },
@@ -1244,36 +1145,19 @@ fn build_storage_target(
         ],
     });
 
-    let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("steel-pulse:blit:bg"),
-        layout: blit_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&sampled_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    });
-
     StorageTarget {
         texture,
         storage_view,
         sampled_view,
         compute_bind_group,
-        blit_bind_group,
     }
 }
 
 /// Human-readable name for a wgpu backend.
 ///
 /// `Backend` implements `Debug` but not `Display`, and the `Debug` rendering
-/// happens to be the exact spelling we want ("Metal", "Vulkan"), so the only
-/// thing to add is the `BrowserWebGpu` spelling, which reads as
-/// `BrowserWebGpu` and is worth humanising.
+/// happens to be the spelling we want for most variants; the two that are not
+/// are spelled out here.
 fn backend_label(backend: wgpu::Backend) -> &'static str {
     match backend {
         wgpu::Backend::Noop => "Noop",
@@ -1287,7 +1171,7 @@ fn backend_label(backend: wgpu::Backend) -> &'static str {
 
 /// Human-readable name for a physical device class.
 ///
-/// Worth spelling out because the distinction is the whole point of asking for
+/// Worth spelling out because the distinction is the point of asking eframe for
 /// a `HighPerformance` adapter: "DiscreteGpu" tells a user nothing, "Discrete
 /// GPU" tells them why their laptop fan is spinning.
 fn device_type_label(device_type: wgpu::DeviceType) -> &'static str {
@@ -1300,6 +1184,34 @@ fn device_type_label(device_type: wgpu::DeviceType) -> &'static str {
     }
 }
 
+/// Renders the adapter list once, for the UI's diagnostics panel.
+///
+/// `RenderState::available_adapters` is `#[cfg]`-gated to non-wasm targets, and
+/// this crate targets macOS and Windows only (see `AGENTS.md`), so the field is
+/// read unconditionally. The `cfg` is noted rather than encoded because a
+/// second code path for a platform this project does not ship to would be
+/// untestable here.
+fn describe_adapters(state: &egui_wgpu::RenderState) -> String {
+    let adapters = &state.available_adapters;
+    if adapters.is_empty() {
+        return "<none reported>".to_owned();
+    }
+    let mut out = String::new();
+    for adapter in adapters {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let info = adapter.get_info();
+        out.push_str(&format!(
+            "{} / {} / {}",
+            info.name,
+            backend_label(info.backend),
+            device_type_label(info.device_type),
+        ));
+    }
+    out
+}
+
 // Compile-time guards for the invariants this module documents but cannot
 // enforce at a call site. A failure here names the exact assumption that broke,
 // which is worth more than the first validation error it would otherwise cause.
@@ -1308,8 +1220,6 @@ const _: () = {
         WORKGROUP_SIZE > 0,
         "a zero workgroup size dispatches nothing"
     );
-    assert!(DESIRED_MAX_FRAME_LATENCY >= 1);
-    assert!(FULLSCREEN_TRIANGLE_VERTICES == 3);
     // 64 bytes today; the point is that the buffer is allocated from the shared
     // constant rather than a literal that could drift from `Uniforms`.
     assert!(UNIFORM_BUFFER_SIZE == 64);
