@@ -82,17 +82,31 @@ Nothing. Every lane that had a file in flight has landed it.
       - Input: drag to pan, wheel to zoom, routed into `Camera`'s
       `target_*` fields rather than the live ones, so easing works.
 
-- [~] **First successful frame.** The milestone's definition of done. A window
+- [x] **First successful frame.** The milestone's definition of done. A window
       opens, `main` in the kernel runs, and the identity map fills the viewport
       with a recognisable hue wheel that is *not* upside down. Take a
       screenshot to `target/` and confirm the orientation before celebrating —
       an unflipped y is the single easiest bug in this project to ship.
 
-      **Status: the crate builds, all 185 tests pass, and the application
-      launches and opens its window** (confirmed by a human at the keyboard).
-      The remaining piece is the orientation check, and it is blocked on
-      tooling rather than on code. See the environment note below — do not
-      assume a blank screenshot means a broken app.
+      **VERIFIED. The y-orientation is correct — there is no flip.** Measured
+      from a GPU readback, not eyeballed: a 24-point hue sweep at r=420 px is
+      monotonic with screen angle, giving cyan at right (+1), red at left
+      (−1), blue-violet at top (+i) and green at bottom (−i). Screen-up is
+      +i and screen-right is +1, so the kernel's `1.0 - uv.y * 2.0` and egui's
+      blit flip cancel as intended. The black origin sits 4 px from the exact
+      centre of a 2848x1880 texture (0.14% of the width), so the aspect
+      correction is right too. Iso-modulus ring radii measured along +x and +y
+      are byte-identical, so the rings are true circles and not ellipses.
+
+      **Do not "fix" this.** An earlier draft of this item predicted the hue
+      above the origin would be green and below magenta. That prediction is
+      wrong and self-inconsistent: the shader uses `turns = angle / TAU + 0.5`,
+      a *positive* slope, so +i maps to hue 0.75 (blue-violet) and −i to 0.25
+      (green). No single hue slope produces the green/magenta/cyan/red set
+      that was assumed, and a change made to satisfy it would invert a
+      correct implementation. The `+0.5` offset is deliberate and documented
+      in the shader: it puts the positive real axis at cyan and makes the
+      barrier where a function blows up read as a red line.
 
       **Scope: 15 of the 16 functions render correctly with `iterate` off**,
       which is the path the first frame should be judged on. The iterated path

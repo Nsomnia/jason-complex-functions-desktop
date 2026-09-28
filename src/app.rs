@@ -140,6 +140,9 @@ struct Core {
     /// Where the most recent screenshot went, or why it failed. Shown as a
     /// transient overlay in the plot area.
     last_screenshot: Option<String>,
+    /// Quit once a screenshot has been written. Only ever set together with
+    /// `screenshot_requested`, so the flag cannot be left set by hand.
+    exit_after_capture: bool,
 }
 
 /// The subset of [`Uniforms`] plus the target size that determines what the
@@ -187,6 +190,12 @@ impl RenderKey {
 
 impl Core {
     fn new() -> Self {
+        // Setting `STEEL_PULSE_CAPTURE` writes one frame to a PPM and quits.
+        // It exists because OS screenshotting cannot verify this project on
+        // some machines, so the app has to be able to inspect its own output
+        // unattended. Unset by default: an interactive session never
+        // auto-quits, which would be infuriating.
+        let capture_on_exit = std::env::var_os("STEEL_PULSE_CAPTURE").is_some();
         Self {
             camera: Camera::new(),
             uniforms: Uniforms::default(),
@@ -198,8 +207,9 @@ impl Core {
             pending_action: None,
             size_dirty: true,
             last_frame_start: None,
-            screenshot_requested: false,
             last_screenshot: None,
+            screenshot_requested: capture_on_exit,
+            exit_after_capture: capture_on_exit,
         }
     }
 
@@ -377,6 +387,10 @@ impl eframe::App for App {
         self.core.service_screenshot();
         if self.core.screenshot_requested {
             ui.ctx().request_repaint();
+        } else if self.core.exit_after_capture {
+            // Unattended capture mode: the frame is on disk, so leave. Without
+            // this the process would sit in an event loop with nothing to do.
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
         // Keep repainting while anything is still moving. Once the camera has
