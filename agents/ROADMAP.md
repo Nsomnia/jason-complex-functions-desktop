@@ -47,7 +47,8 @@ phases can accumulate into rather than throw away.
   panic: the window should open and say so.
 - **The iterated path draws nothing useful for `julia`.** Not a defect to be
   patched and not blocking the first frame; it is a design question that cannot
-  be settled without a rendered picture to look at. See
+  be settled without a rendered picture to look at. The likely cause is the
+  *parameter* rather than the arithmetic. See
   [escape handling for iterated plots](#escape-handling-for-iterated-plots) below.
 
 ### Escape handling for iterated plots
@@ -62,11 +63,24 @@ overflowed at about `|w| = 1.8e19`. A classical escape-time plot would bail at
 `|w| > 2` and colour by iteration count; this one colours the final iterate.
 
 For most functions that is fine. For `julia` (id 15, `c = -0.7269 + 0.1889i`) it
-is not: the critical orbit is chaotic but bounded in exact arithmetic — that is
-what makes the Julia set interesting — and `f32` rounding does not respect the
-bound. Measured on this machine: the orbit of 0 escapes at iteration 120; at the
-default `max_iter = 256` about 92% of a 3x3 viewport comes out non-finite and
-therefore black; at `max_iter = 4096` the whole frame is black.
+is not, but **not for the reason the shader's own `KNOWN LIMITATION` comment
+gives.** That comment says the critical orbit is "chaotic but bounded in exact
+arithmetic" and that `f32` rounding pushes it off the fractal. The lane that
+wrote `src/functions.rs` measured this independently in `f64` and got a
+different answer, pinned by the test
+`the_julia_parameter_is_a_dendrite_so_everything_slowly_escapes`:
+
+- `c = -0.7269 + 0.1889i` is a **dendrite** parameter. Its Julia set is
+  connected and infinitely branched but has **empty interior** — no bounded
+  Fatou components, no inside at all.
+- Sweeping a 48x48 grid in `f64` and iterating, the slowest escape observed was
+  **1814 steps**. There is no large region that stays bounded.
+
+So the orbits escape in `f64` too, only more slowly. **The 92%-black result is
+therefore not primarily an `f32` artifact.** This parameter has no filled set, so
+an iterated plot of it is mostly escape behaviour regardless of what
+floating-point precision you use. The `f32`-does-lose-the-argument problem is
+real but much smaller, and it is not what makes the frame black.
 
 **The subtler half, which is the one that matters.** The above is the obvious
 story and it is the smaller half. The colour scheme does something worse first.
@@ -86,9 +100,9 @@ then snaps to **black**. That discontinuity is an `f32` artifact, not the
 intended design: the scheme's own convention is that a large modulus means
 bright, and bright saturating into black contradicts it. A plot that receded
 smoothly to black at the escape boundary would be defensible. A plot that goes
-white, sits in white for twelve decades, then snaps to black, is neither. **Any
-proposed fix should be judged on the white-to-black half, not the overflow
-half.**
+white, sits in white for twelve decades, then snaps to black, is neither. **This
+one is worth fixing whatever parameter is chosen** — it is a presentation
+problem sitting on top of the escape problem, not the reason the plot is black.
 
 **This is not a bug, and specifically not a rule-3 violation.** The CPU
 reference in `src/functions.rs` does the same thing, which is precisely what the
@@ -97,18 +111,32 @@ different problem from two sides disagreeing, and it is the far more tractable
 one. Do not clamp it, do not raise it as a shader defect, and do not "fix" one
 side to make the plot prettier.
 
-**Two candidate fixes, and they are not equivalent.**
+### Candidate fixes, ranked
 
-*The classical one — colour by escape time.* Bail at `|w| > T`, accumulate the
-iteration count, shade by the count. This is what most fractal software does. It
-needs `T` and the count in the uniform block, so it is a full ABI change with
-the whole procedure in [ABI.md](ABI.md), and it inverts this app's current
-convention (classical Julia rendering is bright-outside, black-inside; this app
-draws the origin black and brightens with modulus).
+**1. Change the parameter. Cheapest, and probably the right one.** If the
+parameter is the problem — and a parameter with no filled interior plausibly is
+— then the fix is a different parameter, not a different algorithm. Julia sets
+with a genuine filled interior come from parameters well inside the Mandelbrot
+set:
 
-*Renormalisation, undecided.* Once `|w|` exceeds `T` (`1e4` is reasonable),
-divide `w` by `T` and accumulate `ln(T)` into a running log-modulus. Three
-consequences, and they are all good ones:
+| `c` | what you get |
+|---|---|
+| `-0.75` | basilica-like set on the real axis, the canonical beginner choice |
+| `-0.123 + 0.745i` | the Douady rabbit, visibly intricate with a real interior |
+| `0.285 + 0.01i` | a small, well-contained set |
+
+This is a **one-constant change**: `JULIA_C` in `src/functions.rs` and `JULIA_C`
+in `shaders/domain_coloring.wgsl`, both sides in the same commit, per the
+CPU/GPU agreement rule. The function id stays 15, the formula string stays
+`z^2 + c`, and **nothing in the ABI moves** — `Uniforms` is untouched, at 64
+bytes. It is ranked first because it converts a broken plot into a working one
+with a constant, and because a set with interior is a far better demonstration
+of what this program is for than a measure-zero dendrite.
+
+**2. Renormalisation — but its premise is not established.** Once `|w| exceeds
+`T` (`1e4` is reasonable), divide `w` by `T` and accumulate `ln(T)` into a
+running log-modulus. In isolation three consequences follow, and they are all
+good ones:
 
 1. `|w|` stays bounded, so it can never overflow and the `c_finite` black never
    fires.
@@ -122,21 +150,40 @@ Feed it into the shading as an extra attenuation, `value *= 1 / (1 +
 log_modulus * escape_scale)`, and the filled set stays bright while the
 complement recedes smoothly to black instead of through white.
 
+**But renormalisation exists to keep bounded orbits bounded so that a filled
+Julia set survives to high iteration counts.** This parameter has no filled set,
+so there is nothing for it to preserve. Applying it here would be fixing a
+problem the parameter does not have, and the accumulated log-modulus would be
+carrying escape information for a set that is not there. If fix 1 is taken,
+renormalisation becomes a question about whether a *different* parameter needs
+it, not a fix for this frame.
+
 **Renormalisation needs no ABI change at all.** The accumulator is a kernel-local
 variable, not a uniform; `Uniforms` stays 64 bytes. This is worth stating
 because the shader's own `KNOWN LIMITATION` comment concludes that fixing this
 "changes both the algorithm and the ABI" — that is true of the *classical*
-escape-time fix, which must carry the threshold and the count in a uniform. Do
-not conflate the two when deciding.
+escape-time fix (fix 3 below), which must carry the threshold and the count in a
+uniform. Do not conflate the two when deciding.
 
-**What is missing, and it is not a small thing: a rendered frame.** `T` and above
-all `escape_scale` are visual judgements, not derivable constants. Too small an
-`escape_scale` and the entire viewport is black; too large and the escape
-boundary is invisible and everything is white. **A future session must not pick
-these blind**, because either wrong value ships a plot that looks broken for a
-reason unrelated to the code. This is the explicit dependency that keeps the
-item honestly not-blocked-by-accident: it is checkable in one minute once the
-first frame is up, and it is not checkable at all until then.
+**3. The classical escape-time plot, and why it is not first.** Bail at `|w| >
+T`, accumulate the iteration count, shade by the count. This is what most
+fractal software does. It needs `T` and the count in the uniform block, so it is
+a full ABI change with the whole procedure in [ABI.md](ABI.md), and it inverts
+this app's current convention (classical Julia rendering is bright-outside,
+black-inside; this app draws the origin black and brightens with modulus). Most
+expensive of the three, and it treats a symptom that fixes 1 may remove entirely.
+
+**What is missing, and it is not a small thing: a rendered frame.** Whichever
+route is chosen, the exact look is a tuning problem, and tuning it needs a real
+rendered frame to look at. For fix 1 the judgement is *which* parameter looks
+best; for fix 2, `T` and above all `escape_scale` are visual judgements, not
+derivable constants — too small an `escape_scale` and the entire viewport is
+black, too large and the escape boundary is invisible and everything is white.
+**A future session must not pick either blind**, because the wrong value ships a
+plot that looks broken for a reason unrelated to the code. This is the explicit
+dependency that keeps the item honestly not-blocked-by-accident: it is
+checkable in one minute once the first frame is up, and it is not checkable at
+all until then.
 
 **Scope: not blocking the first successful frame.** 15 of the 16 functions are
 correct with `iterate` off, and un-iterated `julia` draws a perfectly good
@@ -418,10 +465,12 @@ is a worse product than a slightly wrong one that keeps up.
   plot that looks right here may band there. Needs someone with the hardware.
 - **f32 renormalisation** would allow far higher `max_iter`, at the cost of
   changing the colour scheme, because the accumulated modulus carries the
-  information the shading depends on. This is the same technique as
-  [escape handling for iterated plots](#escape-handling-for-iterated-plots) and
-  it should be the *same decision*: settle that one, and this falls out as a
-  secondary benefit rather than a reopening.
+  information the shading depends on. It is the same technique as
+  [escape handling for iterated plots](#candidate-fixes-ranked) and it should be
+  the *same decision*: settle that one, and this falls out as a secondary
+  benefit rather than a reopening. Note that its premise there is currently
+  **unproven** — the present parameter has no filled set for it to preserve — so
+  this benefit is speculative until a parameter with interior is chosen.
 
 ### Done means
 

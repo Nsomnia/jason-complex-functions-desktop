@@ -111,13 +111,17 @@ Nothing. Every lane that had a file in flight has landed it.
 - [ ] **Escape handling for iterated plots.** The iterated path currently
       produces an all-black frame for `julia` (id 15). This is a design question
       about the specified algorithm, **not** a shader bug — the CPU reference
-      reproduces it exactly, which is the point of rule 3. Full analysis, the
-      measured numbers, and the candidate fix are in
+      reproduces it exactly, which is the point of rule 3. And it is not mainly
+      an `f32` artifact either: the parameter is a **dendrite**, so the Julia set
+      has empty interior and almost every orbit escapes in `f64` too. The
+      cheapest fix is therefore probably a different `c`, not a different
+      algorithm. Full analysis, the measured numbers, and both candidate fixes
+      are in
       [Known open questions](#escape-handling-for-iterated-plots-the-biggest-open-question-in-milestone-1)
-      and in [agents/ROADMAP.md](agents/ROADMAP.md) phase 1. Do not paper over
-      it with a clamp; the fix is a real decision with a visual-tuning
-      dependency, and it needs a rendered frame to choose the constants. Not
-      blocking the first successful frame — see the note above.
+      and in [agents/ROADMAP.md](agents/ROADMAP.md) phase 1. Do not paper over it
+      with a clamp, and do not pick a parameter blind: this is a real decision
+      that needs a rendered frame in front of it. Not blocking the first
+      successful frame — see the note above.
 
 - [ ] **Cross-compile / CI notes.** Record, in
       [agents/ENVIRONMENT.md](agents/ENVIRONMENT.md):
@@ -254,20 +258,35 @@ gets its own section because it is the one question in milestone 1 that cannot
 be settled without rendering something and looking at it.
 
 **The symptom.** With `iterate` on and `func_id = 15` (`julia`,
-`c = -0.7269 + 0.1889i`), the frame is black. Measured on this machine: the
-critical orbit of 0 escapes at iteration 120; at the default `max_iter = 256`
-about **92% of a 3x3 viewport** comes out non-finite and therefore black; at
-`max_iter = 4096` the frame is entirely black.
+`c = -0.7269 + 0.1889i`), the frame is black. Measured on this machine: at the
+default `max_iter = 256` about **92% of a 3x3 viewport** comes out non-finite
+and therefore black; at `max_iter = 4096` the frame is entirely black.
 
-**Why.** The `julia` function's critical orbit is chaotic but bounded in exact
-arithmetic — that is what makes the Julia set interesting. `f32` rounding does
-not respect the bound, and pushes the orbit off the fractal. There is also a
-second, slower-growing reason: the loop has no bailout, so a *slowly* escaping
-orbit burns all 4096 iterations before anything notices.
+**Why — and note this corrects an earlier version of this document.** An earlier
+draft of this file, and the shader's own `KNOWN LIMITATION` comment, attributed
+the black frame to `f32` rounding pushing a bounded orbit off the fractal. The
+lane that wrote `src/functions.rs` measured it in `f64` and got a different
+answer, pinned by the test
+`the_julia_parameter_is_a_dendrite_so_everything_slowly_escapes`:
 
-**The real half of the problem, which is easy to miss.** The obvious story is
-"overflow goes non-finite, non-finite draws black". True, and it is the smaller
-half. The colour scheme does something worse first:
+- `c = -0.7269 + 0.1889i` is a **dendrite** parameter. Its Julia set is
+  connected and infinitely branched but has **empty interior** — no bounded
+  Fatou components, no inside at all.
+- Sweeping a 48x48 grid in `f64` and iterating, the *slowest* escape observed was
+  **1814 steps**. There is no large region that stays bounded.
+
+So the orbits escape in `f64` too, only more slowly. **The 92%-black result is
+therefore not primarily an `f32` artifact.** This parameter has no filled set,
+so an iterated plot of it is mostly escape behaviour regardless of what
+floating-point precision you use. `f32` does lose the argument once the value
+overflows, and that is a real defect, but it is a much smaller one than the
+black frame, and it is not the cause of the black frame.
+
+**A real second problem, which the reframing does not excuse.** The escape test
+in `main` is `c_finite`, which only fires once `f32` has overflowed at about
+`|w| = 1.8e19`. There is no bailout radius, so a slowly-escaping orbit burns all
+4096 iterations before anything notices. Independently of that, the colour
+scheme does something odd on the way out:
 
 ```
 value = pow(m / (1 + m), modulus_shading)      // modulus_shading = 1.0 by default
@@ -279,17 +298,34 @@ there for the next twelve orders of magnitude. Only at `|w| ~ 1.8e19`, where
 `f32` overflows and `c_finite` finally goes false, does the pixel snap to black.
 
 So a diverging orbit passes through **white and then snaps to black**. That
-white-to-black discontinuity is an `f32` artifact, not the intended design. The
-intended reading of the scheme is that a large modulus means bright, and
-"bright" saturating into "black" contradicts it. A plot that went smoothly to
-black at the escape boundary would be a defensible design choice; a plot that
-goes white, sits in white for twelve decades, and then snaps to black is
-neither. **Judge the fix on the second half of this, not the first.**
+white-to-black discontinuity is an `f32` artifact, and it is worth fixing
+regardless of which parameter is chosen — but it is a *presentation* problem
+sitting on top of the escape problem, not the reason the plot is black.
 
-**The candidate fix — renormalisation, undecided.** Standard practice, and cheap:
-in the iteration loop, once `|w|` exceeds a threshold `T` (`1e4` is reasonable),
-divide `w` by `T` and accumulate `ln(T)` into a running log-modulus. Two things
-fall out of this:
+### Candidate fixes, in the order they should be tried
+
+**1. Change the parameter. Cheapest, and probably the right one.** If the
+parameter is the problem, the fix is a different parameter. Julia sets with a
+genuine filled interior come from parameters well inside the Mandelbrot set:
+
+| `c` | what you get |
+|---|---|
+| `-0.75` | basilica-like set on the real axis, the canonical beginner choice |
+| `-0.123 + 0.745i` | the Douady rabbit, visibly intricate with a real interior |
+| `0.285 + 0.01i` | a small, well-contained set |
+
+This is a **one-constant change**: `JULIA_C` in `src/functions.rs` and
+`JULIA_C` in `shaders/domain_coloring.wgsl`, both sides, same commit, per rule 3
+in [AGENTS.md](AGENTS.md). The function id stays 15, the formula string
+stays `z^2 + c`, and **nothing in the ABI moves**. `Uniforms` is untouched.
+It is ranked first because it converts a broken plot into a working one with a
+constant, and because a set with interior is a much better demonstration of what
+this program is for than a measure-zero dendrite.
+
+**2. Renormalisation — but its premise is not established.** Standard practice,
+and cheap in isolation: in the iteration loop, once `|w|` exceeds a threshold
+`T` (`1e4` is reasonable), divide `w` by `T` and accumulate `ln(T)` into a
+running log-modulus. Two things fall out of this:
 
 - `|w|` stays bounded inside `f32`, so it **can never overflow**, and the
   `c_finite` black never fires.
@@ -297,9 +333,17 @@ fall out of this:
   the hue — is untouched. Only the modulus is rescaled, and the accumulated
   log-modulus recovers exactly the information the rescaling destroyed.
 
+**But renormalisation exists to keep bounded orbits bounded so that a filled
+Julia set survives to high iteration counts.** This parameter has no filled set,
+so there is nothing for it to preserve. Applying it here would be fixing a
+problem the parameter does not have, and the accumulated log-modulus would be
+carrying escape information for a set that is not there. **Its premise is not
+established.** If fix 1 is taken, renormalisation becomes a question about
+whether a *different* parameter needs it, not a fix for this frame.
+
 The accumulated log-modulus is monotonically related to escape time for an
-exponentially diverging orbit, which makes it a usable stand-in for one. Feed
-it into the shading as an extra attenuation term:
+exponentially diverging orbit, so where it does apply it is a usable stand-in
+for one. Feed it into the shading as an extra attenuation term:
 
 ```
 value *= 1 / (1 + log_modulus * escape_scale)
@@ -321,11 +365,13 @@ escape-time fix, which needs a uniform to carry the escape threshold and the
 count. Renormalisation needs neither. Do not conflate the two fixes when
 deciding.
 
-**What it needs that is not available yet: a rendered frame.** The exact look is
-a tuning problem. `T` and especially `escape_scale` are visual judgements —
-`escape_scale` too small and the whole viewport is black; too large and the
+**What it needs that is not available yet: a rendered frame.** Whichever route
+is chosen, the exact look is a tuning problem, and tuning it needs a real
+rendered frame to look at. For fix 1 the judgement is *which* parameter looks
+best; for fix 2, `T` and especially `escape_scale` are visual judgements —
+`escape_scale` too small and the whole viewport is black, too large and the
 escape boundary is invisible and everything is white. **A future session must
-not pick these blind.** Render, look, adjust. This is the explicit dependency
+not pick either blind.** Render, look, adjust. This is the explicit dependency
 that makes the item not-blocked-by-accident: it is checkable in one minute of
 work once the first frame is up, and it is not checkable at all until then.
 
@@ -338,16 +384,31 @@ nothing iterates and nothing overflows. Land the first frame first.
 same thing, which is exactly the agreement rule 3 asks for. The two sides agree
 on a bad answer, which is a different problem from the two sides disagreeing.
 
-**One structural asymmetry to watch while fixing it.** The two iteration loops
-are not literally the same code. The shader's `apply_selected` breaks out as
-soon as `c_finite(w)` goes false; `functions::eval` runs all `steps`
-iterations with no early exit. For a polynomial the two still agree on the
-observable outcome — once a value is non-finite, applying a polynomial to it
+**One structural asymmetry to watch while fixing it, still open.** The two
+iteration loops are not literally the same code. The shader's `apply_selected`
+breaks out as soon as `c_finite(w)` goes false; `functions::eval` runs all
+`steps` iterations with no early exit. For a polynomial the two still agree on
+the observable outcome — once a value is non-finite, applying a polynomial to it
 leaves it non-finite, so both end black — but for any function that can map a
 non-finite input back to a finite one, `1/z` being the obvious candidate, they
 can part company. The two loops are already close enough to being the same
 transcription that this is easy to miss and hard to debug, so if you are in this
 area anyway, make them match deliberately rather than by accident.
+
+**A consequence of that asymmetry, newly measured: an escaped orbit is infinity
+for exactly one step and `NaN` from the next**, because `inf * 0` is `NaN` in
+IEEE-754. So the imaginary part of a real infinity becomes `NaN` one
+application later. This is pinned by
+`an_escaped_orbit_is_infinity_first_and_nan_afterwards` in `src/functions.rs`
+and noted on `Complex`'s `Mul`. Two rules follow, and both are easy to get
+wrong:
+
+- **Callers must test `is_finite`, never `is_infinite`.** A test for infinity
+  will pass on the first escaping step and then silently start returning false
+  once the value turns to `NaN`, which looks exactly like an orbit that came
+  back.
+- If the two loops are made to match, match them on *the same* predicate. The
+  shader's `c_finite` and `Complex::is_finite` already agree; keep it that way.
 
 **Milestone 2, the hard part**
 

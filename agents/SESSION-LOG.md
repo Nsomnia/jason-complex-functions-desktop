@@ -267,6 +267,84 @@ Nothing attempted here failed. Two things worth recording as *not* done:
    already written. Start from the renormalisation candidate; do not re-derive
    the analysis.
 
+   > **Superseded by entry 3.** The f64 measurement taken afterwards shows the
+   > parameter, not the precision, is the problem, and the cheapest fix is a
+   > different `JULIA_C`. Do not start from renormalisation. Read entry 3 first.
+
+---
+
+## 3. The dendrite correction — 2026-09-28
+
+### Situation
+
+Two lanes measured the black-frame problem with `julia` (id 15) and got
+different answers. The WGSL lane, working from the shader, concluded the critical
+orbit is "chaotic but bounded in exact arithmetic" and that `f32` rounding
+pushes it off the fractal. The lane that wrote `src/functions.rs` measured in
+`f64` and concluded the opposite: `c = -0.7269 + 0.1889i` is a **dendrite**
+parameter, its Julia set has **empty interior**, and a 48x48 `f64` sweep found
+the slowest escape at **1814 steps**. Pinned by
+`the_julia_parameter_is_a_dendrite_so_everything_slowly_escapes`.
+
+### Attempted
+
+Reconcile the two, and correct the documentation that had been written from the
+first measurement.
+
+### Worked
+
+- **The `f64` measurement is the better one and it supersedes the framing.** The
+  orbits escape in `f64` too, only more slowly. The 92%-black frame is therefore
+  not primarily an `f32` artifact. Corrected in [../TODO.md](../TODO.md) and in
+  [ROADMAP.md](ROADMAP.md) phase 1, including an explicit note that this corrects
+  an earlier version of the document and that the shader's own `KNOWN
+  LIMITATION` comment carries the superseded claim.
+- **A cheaper fix was revealed and is now ranked first: change the parameter.**
+  `c = -0.75`, `-0.123 + 0.745i`, or `0.285 + 0.01i` all give sets with a real
+  interior. That is a one-constant change to `JULIA_C` in both `src/functions.rs`
+  and `shaders/domain_coloring.wgsl`, same commit, and **nothing in the ABI
+  moves** — id 15 and the `z^2 + c` formula string are unchanged.
+- **Renormalisation was demoted, with a reason rather than a shrug.** It exists
+  to keep bounded orbits bounded so a filled set survives. With an empty-interior
+  set there is nothing to preserve, so applying it would be fixing a problem this
+  parameter does not have. Its premise is recorded as not established.
+- **Kept the structural asymmetry and extended it.** The shader's
+  `apply_selected` breaks on non-finite; `functions::eval` has no early exit.
+  Newly measured detail: an escaped orbit is infinity for exactly one step and
+  `NaN` from the next, because `inf * 0` is `NaN` in IEEE-754 — so callers must
+  test `is_finite`, never `is_infinite`. Pinned by
+  `an_escaped_orbit_is_infinity_first_and_nan_afterwards` and noted on
+  `Complex`'s `Mul`.
+
+### Did not work
+
+Nothing failed. Not done, and deliberately so: no parameter was changed and no
+renormalisation was implemented. Choosing between `-0.75`, the Douady rabbit and
+`0.285 + 0.01i` is a **visual judgement** that needs a rendered frame, and the
+first frame still does not exist — `src/app.rs` is still a one-line placeholder
+and `cargo check` still reports exactly one error. Picking a parameter blind is
+the specific mistake both the TODO and the roadmap now warn against.
+
+### Decisions
+
+- **The `f64` measurement wins over the `f32`-centric story**, on the grounds
+  that it was measured in the reference precision and pinned by a test. The
+  `f32` loss of argument after overflow is real but is a much smaller failure,
+  and it is not the cause of the black frame.
+- **Changing the parameter outranks changing the algorithm**, because it is a
+  constant rather than a redesign, and because a set with interior is a better
+  demonstration of the program than a measure-zero dendrite.
+- **Corrections were made in place with the correction visible**, not silently
+  rewritten. The superseded framing is named, the test that supersedes it is
+  cited, and session-log entries 1 and 2 are left as written.
+
+### Next
+
+1. Write `src/app.rs`. Still the only thing between this project and a first
+   frame, and therefore still the gate on every tuning decision above.
+2. First frame: screenshot it, check the orientation before anything else.
+3. Then choose the Julia parameter, with the frame in front of you.
+
 ---
 
 ## Template
@@ -332,3 +410,6 @@ line points at the entry that made the call.
 | Escape handling is a design question, not a defect; do not clamp it | 2 |
 | Renormalisation needs no ABI change; classical escape-time does | 2 |
 | Escape handling does not gate the first frame (15/16 un-iterated are fine) | 2 |
+| The `f64` dendrite measurement supersedes the `f32`-centric story | 3 |
+| Changing `JULIA_C` outranks changing the algorithm | 3 |
+| Renormalisation's premise is unproven for a set with empty interior | 3 |
