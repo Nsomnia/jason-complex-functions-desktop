@@ -162,20 +162,60 @@ recorded further down, not a readback bug.
       *something* the right shape. This keeps the "presentation is
       presentation" rule honest.
 
-- [ ] **Escape handling for iterated plots.** The iterated path currently
-      produces an all-black frame for `julia` (id 15). This is a design question
-      about the specified algorithm, **not** a shader bug — the CPU reference
-      reproduces it exactly, which is the point of rule 3. And it is not mainly
-      an `f32` artifact either: the parameter is a **dendrite**, so the Julia set
-      has empty interior and almost every orbit escapes in `f64` too. The
-      cheapest fix is therefore probably a different `c`, not a different
-      algorithm. Full analysis, the measured numbers, and both candidate fixes
-      are in
-      [Known open questions](#escape-handling-for-iterated-plots-the-biggest-open-question-in-milestone-1)
-      and in [agents/ROADMAP.md](agents/ROADMAP.md) phase 1. Do not paper over it
-      with a clamp, and do not pick a parameter blind: this is a real decision
-      that needs a rendered frame in front of it. Not blocking the first
-      successful frame — see the note above.
+- [x] **Escape handling for iterated plots — FIXED, and it was the parameter.**
+      `julia` (id 15) rendered ~92% black with `iterate` on. The `JULIA_C` constant
+      is now `-0.75` on both sides (`src/functions.rs` and
+      `shaders/domain_coloring.wgsl`, same commit per rule 3), replacing
+      `-0.7269 + 0.1889i`.
+
+      The decision was made by measurement, not taste. Sweeping a 96x96 grid over
+      `[-2,2]^2` and counting points still finite after 2000 iterations:
+
+      | `c` | bounded | filled set? |
+      |---|---|---|
+      | `-0.7269 + 0.1889i` (old) | 0.00% | no — dendrite, empty interior |
+      | **`-0.75`** | **12.89%** | yes |
+      | `-0.123 + 0.745i` (rabbit) | 8.01% | yes |
+      | `0.285 + 0.01i` | 0.00% | no — outside M, Cantor dust |
+      | `-0.8 + 0.156i` | 0.00% | no |
+      | `-0.01 + 0.65i` | 0.00% | no |
+
+      `0.285 + 0.01i` had been listed here as a "small, well-contained set". It
+      measures zero and was wrong; do not reinstate it. Only two of the six
+      candidates have interior at all, which is the whole reason the old value
+      looked broken.
+
+      **Verified on the GPU**, not just on the CPU: a rendered frame is 15.28%
+      structured against 15.3% predicted from the set's bounding box, and the
+      measured half-width of 1.497 matches the repelling fixed point of
+      `z^2 - 0.75`, which is exactly 1.5, to 0.2%. Connected, fractal, and
+      mirror-symmetric about the real axis (97.2% of sampled pixel pairs
+      identical under reflection).
+
+      Two corrections to notes elsewhere in this file, both made by the same
+      measurement pass:
+      - `-0.75` is **not** the basilica. `c = -1` is. `-0.75` is the root of the
+        period-2 hyperbolic component, where the critical orbit converges to the
+        parabolic fixed point `-0.5`.
+      - The remaining flatness of the interior is **not** a bug. Colouring the
+        final iterate means that after a few hundred iterations every interior
+        point has collapsed onto the attractor, so `|w|` is nearly constant
+        inside; at `max_iter = 256`, 94.9% of structured pixels land in the
+        32-63/255 band. Restoring interior contrast is a colour-scheme change,
+        not a fix.
+
+      Still open, and unchanged by this: there is no escape-radius bailout, so
+      divergence is only noticed at `f32` overflow, and the shading still
+      passes through white before snapping to black. See the Known open
+      questions section.
+
+- [ ] **Restore interior contrast in iterated plots.** A direct consequence of
+      the fix above, and the reason the Julia plot looks muted: colouring the
+      final iterate loses all interior structure once the orbit has converged
+      onto an attractor. The candidates are minimum-modulus-along-the-orbit,
+      or colouring by escape time. Both change the specified colour scheme and
+      the second needs a uniform to carry the threshold, so this is a design
+      decision, not a bug fix.
 
 - [ ] **Cross-compile / CI notes.** Record, in
       [agents/ENVIRONMENT.md](agents/ENVIRONMENT.md):

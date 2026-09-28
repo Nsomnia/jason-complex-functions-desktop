@@ -196,9 +196,23 @@ impl Core {
         // unattended. Unset by default: an interactive session never
         // auto-quits, which would be infuriating.
         let capture_on_exit = std::env::var_os("STEEL_PULSE_CAPTURE").is_some();
+        let mut uniforms = Uniforms::default();
+        // Automated verification overrides. These exist so a specific function
+        // and iteration state can be rendered and captured without a human at
+        // the keyboard, which is the only way to check a plot in environments
+        // where OS screenshotting cannot reach the rendered surface.
+        if let Some(f) = std::env::var("STEEL_PULSE_FUNC").ok().and_then(|v| v.parse().ok()) {
+            uniforms.func_id = f;
+        }
+        if let Some(i) = std::env::var("STEEL_PULSE_ITERATE").ok().and_then(|v| v.parse().ok()) {
+            uniforms.iterate = i;
+        }
+        if let Some(m) = std::env::var("STEEL_PULSE_MAX_ITER").ok().and_then(|v| v.parse().ok()) {
+            uniforms.max_iter = m;
+        }
         Self {
             camera: Camera::new(),
-            uniforms: Uniforms::default(),
+            uniforms,
             telemetry: Telemetry::new(),
             renderer: None,
             renderer_error: None,

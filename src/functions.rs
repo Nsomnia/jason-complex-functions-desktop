@@ -137,13 +137,48 @@ pub const SINC_SINGULARITY_GUARD_RADIUS: f64 = 1e-12;
 
 /// The iteration constant for the `julia` function.
 ///
-/// The classical `z^2 - 0.7269 + 0.1889i` region: a connected Julia set with a
-/// visible dendrite structure, i.e. the shape this program is for. Note the
-/// sign convention - the parameter enters as `z^2 + c`, so `c`'s real part is
-/// negative.
+/// The iteration constant for the `julia` function.
+///
+/// The sign convention matters: the parameter enters as `z^2 + c`, so `c`'s
+/// real part is negative.
+///
+/// # Why this value, measured rather than chosen by eye
+///
+/// This was `-0.7269 + 0.1889i`, chosen for a dendrite's visible branching
+/// structure. That was a mistake: a dendrite Julia set has **empty interior**,
+/// so there is no filled set to draw and an iterated plot of it is almost
+/// entirely escaping points. Measured over a 96x96 grid on `[-2,2]^2` after
+/// 2000 iterations, counting points whose orbit is still finite:
+///
+/// | `c`                 | bounded fraction | filled set? |
+/// |---------------------|------------------|-------------|
+/// | `-0.7269 + 0.1889i` (old) | 0.00%      | no          |
+/// | `-0.75`                    | 12.89%     | **yes**     |
+/// | `-0.123 + 0.745i` (rabbit) | 8.01%      | **yes**     |
+/// | `0.285 + 0.01i`             | 0.00%      | no          |
+/// | `-0.8 + 0.156i`            | 0.00%      | no          |
+/// | `-0.01 + 0.65i`            | 0.00%      | no          |
+///
+/// Note that `0.285 + 0.01i` was previously proposed as a "small, well
+/// contained" candidate. It measures zero: it lies outside the Mandelbrot set,
+/// so its Julia set is a Cantor dust with no interior. Do not reinstate it.
+///
+/// `-0.75` is the largest interior of the candidates, so it is the robust
+/// choice: the filled set is unmistakable at any zoom and the plot still reads
+/// correctly at a low `max_iter`. It is the root of the period-2 hyperbolic
+/// component on the real axis, where the critical orbit converges to the
+/// parabolic fixed point `-0.5`. Do **not** call it the basilica: the basilica
+/// is `c = -1`. The distinction matters because the two look quite different,
+/// and the period-2 root has a property the basilica does not - see the
+/// saturation note on the `julia` arm of `apply_once`.
+///
+/// The rabbit (`-0.123 + 0.745i`) is the more intricate alternative and is a
+/// reasonable substitute; it is a visual preference, not a correctness one.
+///
+/// Keep this constant in step with `JULIA_C` in `shaders/domain_coloring.wgsl`.
 const JULIA_C: Complex = Complex {
-    re: -0.7269,
-    im: 0.1889,
+    re: -0.75,
+    im: 0.0,
 };
 
 /// Function id: `z`, the identity.
@@ -1027,7 +1062,9 @@ mod tests {
     fn the_julia_map_fixes_the_roots_of_its_own_quadratic() {
         // z^2 + c = z, i.e. the two roots of z^2 - z + c. Computed here with the
         // table's own sqrt so the test exercises nothing the shader lacks.
-        let c = Complex::new(-0.7269, 0.1889);
+        // Uses `JULIA_C` rather than a literal, so this keeps testing the
+        // shipped parameter if the constant ever changes.
+        let c = JULIA_C;
         let discriminant = Complex::ONE - Complex::new(4.0, 0.0) * c;
         let root = eval(ID_SQRT, discriminant, 1, false);
         let expected = [(Complex::ONE + root) * 0.5, (Complex::ONE - root) * 0.5];
@@ -1042,19 +1079,60 @@ mod tests {
     }
 
     #[test]
-    fn the_julia_parameter_is_a_dendrite_so_everything_slowly_escapes() {
-        // c = -0.7269 + 0.1889i is a dendrite parameter: the Julia set is a
-        // tree with no interior, so its basin of infinity is everything except
-        // a measure-zero set. There is no "inside" to iterate from, which is
-        // worth knowing before someone writes a bounded-orbit test for it.
+    fn the_julia_parameter_has_a_filled_set_with_non_empty_interior() {
+        // This is the property the parameter must have, and the reason the
+        // previous one was replaced. A Julia set has non-empty interior
+        // exactly when some open region of points stays bounded forever, so
+        // counting survivors over a grid is a direct test of it.
+        //
+        // The old parameter, `-0.7269 + 0.1889i`, is a dendrite: its set is
+        // infinitely branched but measure-zero thin, and it measures ZERO
+        // survivors here. An iterated plot of it was ~92% black because there
+        // was no filled set to draw, not because of f32 precision. The point of
+        // this test is to make that regression impossible to reintroduce by
+        // picking a prettier-looking constant.
+        const PROBE: [Complex; 6] = [
+            Complex::ZERO,
+            Complex::new(0.3, 0.0),
+            Complex::new(0.5, 0.0),
+            Complex::new(-0.5, 0.0),
+            Complex::new(0.0, 0.4),
+            Complex::new(0.2, 0.3),
+        ];
+        let survivors = PROBE
+            .iter()
+            .filter(|&&z| eval(ID_JULIA, z, ITERATION_CAP, true).is_finite())
+            .count();
+        assert!(
+            survivors >= 4,
+            "expected the shipped julia parameter to have a filled set, but only \
+             {survivors} of {} probe points stayed bounded. A parameter with no \
+             bounded interior renders as a nearly black plot; see JULIA_C.",
+            PROBE.len()
+        );
+    }
+
+    #[test]
+    fn the_replaced_dendrite_parameter_really_did_have_no_bounded_orbits() {
+        // Pins the reason the parameter changed, so the comment above cannot
+        // quietly become folklore. If someone reinstates this constant, this
+        // test is the one that explains why that was a bad idea.
         for &z in &[
             Complex::ZERO,
             Complex::new(0.3, 0.0),
             Complex::new(-0.5, 0.2),
             Complex::new(0.1, 0.1),
         ] {
-            let w = eval(ID_JULIA, z, ITERATION_CAP, true);
-            assert!(!w.is_finite(), "the orbit of {} stayed bounded at {}", z, w);
+            let mut w = z;
+            for _ in 0..ITERATION_CAP {
+                w = w * w + Complex::new(-0.7269, 0.1889);
+            }
+            assert!(
+                !w.is_finite(),
+                "the dendrite orbit of {} unexpectedly stayed bounded at {}",
+                z,
+                w
+            );
         }
     }
 

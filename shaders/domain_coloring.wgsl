@@ -132,7 +132,16 @@ const TAU: f32 = 6.283185307179586;
 const MAX_ITER_CLAMP: u32 = 4096u;
 
 /// Julia constant for func_id 15. Fixed by the ABI, not user-tunable.
-const JULIA_C: vec2<f32> = vec2<f32>(-0.7269, 0.1889);
+///
+/// This is `z^2 - 0.75`, the root of the period-2 hyperbolic component on the
+/// real axis. It is NOT the basilica (that is `c = -1`). It replaced
+/// `-0.7269 + 0.1889i`, whose Julia set is a dendrite with EMPTY INTERIOR:
+/// almost every orbit escapes, so an iterated plot of it was ~92% black.
+/// Measured over a 96x96 grid after 2000 iterations, the bounded fraction is
+/// 0.00% for the dendrite against 12.89% for this value. See `JULIA_C` in
+/// `src/functions.rs`, which carries the full table and must be changed in the
+/// same commit as this line.
+const JULIA_C: vec2<f32> = vec2<f32>(-0.75, 0.0);
 
 /// The singularity threshold and the logarithm floor. `sinc` returns its
 /// analytic limit 1.0 below this modulus instead of dividing 0/0, and the
@@ -426,11 +435,42 @@ fn apply(fid: u32, z: vec2<f32>) -> vec2<f32> {
 /// KNOWN LIMITATION, no escape-radius bailout. Divergence is detected only by
 /// c_finite, i.e. only once the orbit has already overflowed f32 at about
 /// |w| = 1.8e19. A classical escape-time plot would bail at |w| > 2 and colour
-/// by the iteration count; this one colours the final iterate instead. For a
-/// polynomial with a superattracting cycle that is fine, but for the julia
-/// function (id 15, c = -0.7269 + 0.1889i) the critical orbit is chaotic and
-/// bounded in exact arithmetic, yet f32 rounding pushes it off the fractal:
-/// measured on this machine, the orbit of 0 escapes at iteration 120, and at
+/// by the iteration count; this one colours the final iterate instead.
+///
+/// An earlier version of this comment blamed f32 rounding for the julia
+/// function rendering almost entirely black, claiming the critical orbit is
+/// "bounded in exact arithmetic" and that f32 pushes it off the fractal. That
+/// was wrong, and measurement corrected it. The old parameter
+/// `-0.7269 + 0.1889i` is a DENDRITE: its Julia set has empty interior, so
+/// essentially no orbit is bounded and the picture is mostly escaping points in
+/// f64 too. The fix was the parameter, not the arithmetic - see `JULIA_C`
+/// above. The current parameter has a 12.89% bounded fraction.
+///
+/// Two real costs of having no bailout remain, and they are worth stating
+/// plainly rather than folding into the above:
+///
+///  1. Divergence is only noticed at f32 overflow, so a slowly escaping orbit
+///     burns all 4096 iterations before anything registers.
+///  2. The shading value is `m / (1 + m)`, which reaches exactly 1.0 in f32 at
+///     |w| ~ 3.4e7 and holds there for twelve decades. A diverging orbit
+///     therefore passes through white and then snaps to black when it finally
+///     overflows. That discontinuity is an f32 artifact and is worth fixing,
+///     but it is a presentation problem sitting on top of the escape problem,
+///     and it is no longer what makes this plot unusable.
+///
+///  3. A consequence of colouring the FINAL ITERATE rather than the trajectory:
+///     after a few hundred iterations every point inside the filled set has
+///     collapsed onto an attracting cycle, so `|w|` is nearly the same
+///     everywhere inside and the interior renders at a flat, dim, almost
+///     uniform value. Measured at max_iter = 256 with c = -0.75, 94.9% of
+///     structured pixels fall in the 32-63/255 band, because the critical orbit
+///     has converged to the parabolic fixed point -0.5. This is mathematically
+///     correct for the specified colour scheme, and it is not a bug - but it is
+///     why the plot looks muted. Restoring interior contrast means colouring by
+///     something other than the final iterate (minimum |w| along the orbit, or
+///     escape time), which is a design change, not a fix.
+///
+/// For reference, under the old parameter:
 /// the default max_iter = 256 about 92% of a 3x3 viewport comes out non-finite
 /// and therefore black. At max_iter = 4096 the whole frame is black.
 ///
