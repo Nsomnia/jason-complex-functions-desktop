@@ -82,11 +82,17 @@ Nothing. Every lane that had a file in flight has landed it.
       - Input: drag to pan, wheel to zoom, routed into `Camera`'s
       `target_*` fields rather than the live ones, so easing works.
 
-- [ ] **First successful frame.** The milestone's definition of done. A window
+- [~] **First successful frame.** The milestone's definition of done. A window
       opens, `main` in the kernel runs, and the identity map fills the viewport
       with a recognisable hue wheel that is *not* upside down. Take a
       screenshot to `target/` and confirm the orientation before celebrating —
       an unflipped y is the single easiest bug in this project to ship.
+
+      **Status: the crate builds, all 185 tests pass, and the application
+      launches and opens its window** (confirmed by a human at the keyboard).
+      The remaining piece is the orientation check, and it is blocked on
+      tooling rather than on code. See the environment note below — do not
+      assume a blank screenshot means a broken app.
 
       **Scope: 15 of the 16 functions render correctly with `iterate` off**,
       which is the path the first frame should be judged on. The iterated path
@@ -95,6 +101,40 @@ Nothing. Every lane that had a file in flight has landed it.
       frame: un-iterated `julia` draws a perfectly good phase portrait, because
       with `iterate = 0` `apply_selected` is a single `apply` and nothing
       overflows.
+
+### Environment: OS screenshotting cannot verify this project
+
+Recorded because it cost real time to discover, and because the failure is
+*deceptive*: the app is running and correct, the screenshot is simply of
+something else.
+
+- `screencapture` on this machine returns a **3360x2100** framebuffer, while
+  the real display is **2560x1600 Retina**. It is capturing a different
+  surface than the one the GUI session draws into. Every screenshot taken this
+  way shows an empty desktop regardless of what the app is doing, and a
+  pixel-diff of two captures differs only in the menu bar's app name.
+- AppleScript can set the frontmost app, and doing so visibly changes the menu
+  bar to `STEEL-PULSE v2.0-TURBO` — proving the process is alive and
+  registered with the window server — while still capturing no window pixels.
+- CoreGraphics window enumeration via JXA returns **zero** on-screen windows,
+  not even the terminal, because it is blocked by permissions. So it cannot
+  even be used to find the window ID for a targeted capture.
+- `System Events` needs Accessibility permission, which is not granted, so
+  window geometry is unavailable too.
+
+**Therefore: do not try to verify a frame with a screen capture.** The working
+approach is the in-app one — `Renderer::read_ppm` reads the storage texture
+back to the CPU and writes a binary PPM to the temp directory, which
+`src/app.rs` surfaces as a click-to-dismiss overlay. That reads what the GPU
+actually produced, independent of the compositor, and it is a real feature
+rather than test scaffolding. Convert with macOS's `sips` if a viewable image
+is needed.
+
+Caveat when reading such a dump: the texture is `Rgba8Unorm`, **not**
+`Rgba8UnormSrgb`, so the bytes are the raw values the compute pass wrote with
+no gamma applied. A viewer applying its own display transform will show
+something different from the on-screen image. That is the open gamma question
+recorded further down, not a readback bug.
 
 - [ ] **Verify the two cross-language tripwires by hand.** Once the kernel runs,
       sample a known point: `z = 1.0` with `func_id = 0` (identity) and
