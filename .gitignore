@@ -1,2 +1,5 @@
+# Build output. ~600 MB; must never be committed.
 /target
-/target
+
+# macOS
+.DS_Store
