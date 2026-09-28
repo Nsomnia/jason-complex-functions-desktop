@@ -135,8 +135,14 @@ mod tests {
         assert_eq!(offset(&u.max_iter as *const u32 as *const u8), 20);
         assert_eq!(offset(&u.func_id as *const u32 as *const u8), 24);
         assert_eq!(offset(&u.phase as *const f32 as *const u8), 28);
-        assert_eq!(offset(&u.modulus_contour_density as *const f32 as *const u8), 32);
-        assert_eq!(offset(&u.phase_contour_density as *const f32 as *const u8), 36);
+        assert_eq!(
+            offset(&u.modulus_contour_density as *const f32 as *const u8),
+            32
+        );
+        assert_eq!(
+            offset(&u.phase_contour_density as *const f32 as *const u8),
+            36
+        );
         assert_eq!(offset(&u.modulus_shading as *const f32 as *const u8), 40);
         assert_eq!(offset(&u.grid_enabled as *const u32 as *const u8), 44);
         assert_eq!(offset(&u.frame as *const u32 as *const u8), 48);

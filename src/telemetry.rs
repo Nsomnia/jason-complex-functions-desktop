@@ -388,7 +388,11 @@ impl Telemetry {
     /// jitter.
     pub fn fps_average(&self) -> f64 {
         let mean = self.history.mean_ms();
-        if mean > 0.0 { 1000.0 / mean } else { 0.0 }
+        if mean > 0.0 {
+            1000.0 / mean
+        } else {
+            0.0
+        }
     }
 
     /// Wall-clock duration of the last completed frame in milliseconds.
