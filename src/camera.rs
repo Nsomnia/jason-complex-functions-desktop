@@ -182,6 +182,18 @@ impl Camera {
     ///
     /// The returned coordinates address pixel centres, so an exact hit on the
     /// centre of pixel `n` returns `n + 0.5`.
+    ///
+    /// `#[allow(dead_code)]`: no runtime caller, and there is nothing honest to
+    /// invent one for. Every feature that exists today reads the *forward*
+    /// direction — pan, zoom-to-cursor and the viewport readout all start from a
+    /// pixel — so the inverse is a one-way street that only a future
+    /// world-space marker or a "fly to this point" command would walk. It is
+    /// kept, rather than deleted, because it is half of the crate's main defence
+    /// against rule 3: `round_trip_is_accurate_within_one_e_minus_nine` and
+    /// `round_trip_survives_panning_and_zooming` are the tests that fail if this
+    /// drifts away from the shader's arithmetic. Deleting the function would
+    /// delete the ability to check that.
+    #[allow(dead_code)]
     pub fn pixel_at_complex(&self, re: f64, im: f64, width: f32, height: f32) -> (f64, f64) {
         let (w, h, aspect) = normalized_viewport(width, height);
         // Invert re = center_re + (uv_x * 2 - 1) * aspect * scale  for uv_x...

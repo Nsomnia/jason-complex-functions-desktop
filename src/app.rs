@@ -7,15 +7,24 @@
 //!   App::update
 //!     |-- Telemetry::begin_frame
 //!     |-- egui_dock::DockArea::show_inside          (borrows &mut dock)
-//!     |     |-- Tab::Controls -> panel::controls    (mutates Uniforms)
+//!     |     |-- Tab::Controls -> panel::panel    (mutates Uniforms)
 //!     |     \-- Tab::Plot     -> draw_plot
-//!     |           |-- input: drag to pan, wheel to zoom -> Camera
+//!     |           |-- input: drag to pan, wheel to zoom, R to reset -> Camera
 //!     |           |-- Renderer::resize(physical pixels of the plot rect)
 //!     |           |-- uniforms.resolution <- renderer.size()   <-- see below
+//!     |           |-- draw_plot_hud          (viewport, map, input legend)
 //!     |           \-- Renderer::render -> TextureId -> paint
 //!     |-- Camera::update(dt)  (ease targets, detect settled)
-//     \-- Telemetry::end_frame
+//!     \-- Telemetry::end_frame
 //! ```
+//!
+//! # What the plot area says about itself
+//!
+//! The controls live in their own dock tab, so a user looking at the plot has
+//! no way to tell which map is on screen, where the viewport is centred, or
+//! what the mouse does. [`draw_plot_hud`] answers all three from the top-left
+//! corner, using the camera's own formatter and the function library's own
+//! names, so none of it can disagree with what is actually being rendered.
 //!
 //! # The resolution invariant
 //!
@@ -43,6 +52,7 @@
 use std::time::{Duration, Instant};
 
 use crate::camera::Camera;
+use crate::complex::functions;
 use crate::panel::{PanelAction, TelemetryView};
 use crate::renderer::{RenderOutcome, Renderer};
 use crate::telemetry::Telemetry;
@@ -60,6 +70,22 @@ const ZOOM_SENSITIVITY: f64 = 0.0015;
 /// another monitor or un-hidden from a stall produces one enormous delta,
 /// which would otherwise snap the camera to its target in a single step.
 const MAX_FRAME_DELTA_SECONDS: f64 = 1.0 / 15.0;
+
+/// Font of the plot area's corner readouts.
+///
+/// Monospace at the small end of the type scale, so the numbers land on the
+/// character grid and do not shift as the camera moves. Deliberately the same
+/// voice as the screenshot notice it sits beside.
+const HUD_FONT: egui::FontId = egui::FontId {
+    size: 12.0,
+    family: egui::FontFamily::Monospace,
+};
+
+/// Baseline spacing between the HUD's lines, in points.
+const HUD_LINE_HEIGHT: f32 = 14.0;
+
+/// Inset of the HUD from the plot rectangle's top-left corner, in points.
+const HUD_INSET: f32 = 8.0;
 
 /// Launch the application.
 ///
@@ -201,13 +227,22 @@ impl Core {
         // and iteration state can be rendered and captured without a human at
         // the keyboard, which is the only way to check a plot in environments
         // where OS screenshotting cannot reach the rendered surface.
-        if let Some(f) = std::env::var("STEEL_PULSE_FUNC").ok().and_then(|v| v.parse().ok()) {
+        if let Some(f) = std::env::var("STEEL_PULSE_FUNC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             uniforms.func_id = f;
         }
-        if let Some(i) = std::env::var("STEEL_PULSE_ITERATE").ok().and_then(|v| v.parse().ok()) {
+        if let Some(i) = std::env::var("STEEL_PULSE_ITERATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             uniforms.iterate = i;
         }
-        if let Some(m) = std::env::var("STEEL_PULSE_MAX_ITER").ok().and_then(|v| v.parse().ok()) {
+        if let Some(m) = std::env::var("STEEL_PULSE_MAX_ITER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
             uniforms.max_iter = m;
         }
         Self {
@@ -299,8 +334,7 @@ impl Core {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let path =
-            std::env::temp_dir().join(format!("steel-pulse-{stamp}.ppm"));
+        let path = std::env::temp_dir().join(format!("steel-pulse-{stamp}.ppm"));
         match std::fs::write(&path, ppm) {
             Ok(()) => format!("saved {}", path.display()),
             Err(err) => format!("screenshot failed: {err}"),
@@ -309,16 +343,17 @@ impl Core {
 
     /// Snapshot the telemetry into the shape the panel renders.
     fn telemetry_view(&self) -> TelemetryView {
-        let (resolution, backend) = match &self.renderer {
+        let (resolution, backend, adapters) = match &self.renderer {
             Some(r) => {
                 let (w, h) = r.size();
-                ([w, h], r.backend_description())
+                ([w, h], r.backend_description(), r.adapter_summary())
             }
             None => (
                 [0, 0],
                 self.renderer_error
                     .clone()
                     .unwrap_or_else(|| "no GPU renderer".to_string()),
+                String::new(),
             ),
         };
 
@@ -340,6 +375,15 @@ impl Core {
                 .map(|f| f64::from(f))
                 .collect(),
         )
+        // The two statistics that need the whole retained window rather than
+        // the last frame, and the one that distinguishes "the GPU was free"
+        // from "nobody measured the GPU".
+        .with_window(
+            self.telemetry.fps_average(),
+            self.telemetry.worst_frame_ms(),
+        )
+        .with_gpu_timing(self.telemetry.has_gpu_timing())
+        .with_adapters(adapters)
     }
 }
 
@@ -520,6 +564,22 @@ fn draw_plot(ui: &mut egui::Ui, core: &mut Core) {
         }
     }
 
+    // `R` goes home. Guarded on egui having no keyboard focus, so a keypress
+    // aimed at a text field — the panel's filter box, a `DragValue` being typed
+    // into — cannot reset the view behind the user's back, and on no modifiers,
+    // so `Cmd-R` and friends are left to the system rather than silently
+    // throwing away the view.
+    //
+    // Note the difference from the panel's RESET VIEW button, which eases home
+    // via `set_target`: a keypress snaps, and `Camera::reset` is what does
+    // that. It also abandons any ease in flight, so `R` pressed during a zoom
+    // lands on exactly the default view rather than re-targeting it.
+    if !ctx.egui_wants_keyboard_input()
+        && ctx.input(|i| i.key_pressed(egui::Key::R) && !i.modifiers.any())
+    {
+        core.camera.reset();
+    }
+
     // Report the failure modes instead of showing a blank plot that looks
     // like a bug in the mathematics.
     if core.renderer.is_none() {
@@ -585,26 +645,30 @@ fn draw_plot(ui: &mut egui::Ui, core: &mut Core) {
             .paint_at(ui, rect);
     }
 
+    // The plot's own readouts, on top of it. Drawn here rather than inside the
+    // controls tab because the plot is what the user is looking at, and the
+    // things it says — which map, where the view is, what the mouse does — are
+    // the things you want while looking at it.
+    draw_plot_hud(ui, rect, core);
+
     // Report where a screenshot went, so the user does not have to go looking
     // in the temp directory for it. Click to dismiss.
     if let Some(message) = core.last_screenshot.clone() {
-        let galley = ui.painter().layout_no_wrap(
-            message,
-            egui::FontId::monospace(12.0),
-            theme::Theme::TEXT,
-        );
+        let galley =
+            ui.painter()
+                .layout_no_wrap(message, egui::FontId::monospace(12.0), theme::Theme::TEXT);
         let margin = 6.0;
         let pad = 4.0;
         let size = galley.size();
         let box_rect = egui::Rect::from_min_size(
-            egui::pos2(
-                rect.left() + 8.0,
-                rect.bottom() - size.y - 2.0 * pad - 8.0,
-            ),
+            egui::pos2(rect.left() + 8.0, rect.bottom() - size.y - 2.0 * pad - 8.0),
             egui::vec2(size.x + 2.0 * margin, size.y + 2.0 * pad),
         );
-        let response =
-            ui.interact(box_rect, ui.id().with("screenshot_notice"), egui::Sense::click());
+        let response = ui.interact(
+            box_rect,
+            ui.id().with("screenshot_notice"),
+            egui::Sense::click(),
+        );
         if response.clicked() {
             core.last_screenshot = None;
         }
@@ -615,8 +679,11 @@ fn draw_plot(ui: &mut egui::Ui, core: &mut Core) {
             egui::Stroke::new(1.0, theme::Theme::CYAN_DIM),
             egui::StrokeKind::Inside,
         );
-        ui.painter()
-            .galley(box_rect.min + egui::vec2(margin, pad), galley, theme::Theme::TEXT);
+        ui.painter().galley(
+            box_rect.min + egui::vec2(margin, pad),
+            galley,
+            theme::Theme::TEXT,
+        );
     }
 }
 
@@ -628,4 +695,62 @@ fn plot_width_logical(rect: egui::Rect) -> f32 {
 /// Height of the plot rectangle in logical points.
 fn plot_height_logical(rect: egui::Rect) -> f32 {
     rect.height().max(1.0)
+}
+
+/// Paint the plot's corner readouts: the viewport, the map, and the input
+/// legend.
+///
+/// Three lines, top-left, in the same small monospace voice as the screenshot
+/// notice at the bottom of the same edge. Everything here is read out of the
+/// state that is actually being rendered this frame — the camera's own
+/// formatter for the view, the function library's own table for the map — so
+/// none of it can describe something other than what is on screen. That is the
+/// reason it is worth drawing at all: it cannot go stale, because it is not a
+/// copy.
+///
+/// The viewport line reports the camera's *current* values rather than its
+/// targets, so during a zoom it reads as motion instead of jumping to the
+/// destination.
+fn draw_plot_hud(ui: &mut egui::Ui, rect: egui::Rect, core: &Core) {
+    let mut y = rect.top() + HUD_INSET;
+    let x = rect.left() + HUD_INSET;
+
+    let mut line = |ui: &mut egui::Ui, text: String, color: egui::Color32| {
+        ui.painter().text(
+            egui::pos2(x, y),
+            egui::Align2::LEFT_TOP,
+            text,
+            HUD_FONT,
+            color,
+        );
+        y += HUD_LINE_HEIGHT;
+    };
+
+    line(
+        ui,
+        core.camera.viewport_description(),
+        theme::Theme::TEXT_DIM,
+    );
+
+    // The map, by id and by name. `label_for` is the never-failing lookup, so a
+    // stale `func_id` from a uniform buffer renders as `unknown` rather than
+    // panicking or silently showing the previous selection — which is the same
+    // thing the shader does with an id it does not know.
+    let id = core.uniforms.func_id;
+    let formula = functions::entry_for(id).map_or("-", |entry| entry.formula);
+    line(
+        ui,
+        format!("[{:02}] {}   {}", id, functions::label_for(id), formula),
+        theme::Theme::TEXT_DIM,
+    );
+
+    // The input legend. Without it the three input modes are undiscoverable: a
+    // user who has only ever moved the mouse over the plot has no reason to
+    // try dragging it, and `R` in particular is invisible until it is written
+    // down somewhere.
+    line(
+        ui,
+        "drag to pan · wheel to zoom · R to reset".to_owned(),
+        theme::Theme::TEXT_FAINT,
+    );
 }

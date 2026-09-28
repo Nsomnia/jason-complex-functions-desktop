@@ -21,15 +21,21 @@
 //!
 //! # The function table
 //!
-//! [`FUNCTION_TABLE`] below is a **hand-maintained mirror** of the `FUNCTIONS`
-//! constant in `src/functions.rs`. `panel.rs` deliberately does not import it:
-//! the panel must keep compiling and the selector must keep rendering even
-//! while the function library is being written, and — more importantly — the
-//! UI needs a *presentation* order and a *search* index that the library has
-//! no reason to know about. If the two ever disagree, the shader dispatches
-//! the wrong map and the picture silently changes, so
-//! [`tests::table_is_in_sync_with_the_library`] exists purely to fail the build
-//! the moment a row is added, renamed or renumbered over there.
+//! There is no table in this file. Every row the selector draws is read out of
+//! [`crate::complex::functions::FUNCTIONS`], which is the same array the
+//! shader's dispatch ids come from, so the panel *cannot* disagree with the
+//! shader about which id is which map: there is only one copy of the answer.
+//! That file used to be mirrored by hand here, with a test comparing the two;
+//! both are gone, and with them the whole class of bug where a row is renamed
+//! in one place and not the other.
+//!
+//! What stays on this side is the *presentation*: the order the groups appear
+//! in ([`GROUP_ORDER`]), their headings ([`group_label`]), and the one-line note
+//! under the selector ([`group_note`]). Those are properties of the UI and the
+//! library has no reason to know about them. [`group_label`] and [`group_note`]
+//! match exhaustively over [`FunctionGroup`], so a seventeenth function with a
+//! new kind fails the build here rather than rendering under a heading nobody
+//! chose.
 //!
 //! # On `#[allow(dead_code)]`
 //!
@@ -52,6 +58,7 @@ use egui::{
     Rect, Sense, Shape, Stroke, TextEdit, Ui,
 };
 
+use crate::complex::functions::{FunctionEntry, FunctionGroup, FUNCTIONS, FUNCTION_COUNT};
 use crate::theme::{self, Theme, FPS_BAD, FPS_WARN, FRAME_BUDGET_MS};
 use crate::uniforms::Uniforms;
 
@@ -92,13 +99,39 @@ pub struct TelemetryView {
     pub backend: String,
     /// Recent frame times in milliseconds, oldest first. Drives the sparkline.
     pub frame_history: Vec<f64>,
+    /// Frame rate averaged over the whole retained window, in frames per
+    /// second. `0.0` before the first frame.
+    ///
+    /// The counterpart to [`TelemetryView::fps`]: `fps` is an exponential
+    /// moving average and tracks a change within a few frames, this one is
+    /// immune to a single spike. The gap between them *is* the jitter signal.
+    pub fps_window: f64,
+    /// Longest frame in the retained window, in milliseconds; `0.0` when
+    /// empty. A mean never notices a hitch; this is where they are.
+    pub worst_ms: f64,
+    /// Whether the adapter has ever reported a GPU timestamp.
+    ///
+    /// `false` means `gpu_ms` is nobody's measurement rather than a measurement
+    /// of zero, and the panel says `n/a` instead of printing a confident
+    /// `0.00 ms`.
+    pub gpu_timing: bool,
+    /// Every GPU adapter wgpu could see at startup, one per line; empty when
+    /// there is no renderer to ask.
+    ///
+    /// Not a frame measurement, but it arrives through the same per-frame value
+    /// because that is the only channel into this panel.
+    /// [`TelemetryView::backend`] is the adapter eframe chose; this is the list
+    /// it chose from.
+    pub adapters: String,
 }
 
 #[allow(dead_code)]
 impl TelemetryView {
-    /// Construct from the six required measurements, with no sparkline history.
+    /// Construct from the six required measurements, with no sparkline history
+    /// and the derived readouts at zero.
     ///
-    /// Attach a trace afterwards with [`TelemetryView::with_history`].
+    /// Attach a trace afterwards with [`TelemetryView::with_history`], and the
+    /// window statistics with [`TelemetryView::with_window`].
     pub fn new(
         fps: f64,
         frame_ms: f64,
@@ -115,6 +148,10 @@ impl TelemetryView {
             resolution,
             backend,
             frame_history: Vec::new(),
+            fps_window: 0.0,
+            worst_ms: 0.0,
+            gpu_timing: false,
+            adapters: String::new(),
         }
     }
 
@@ -122,6 +159,29 @@ impl TelemetryView {
     #[must_use]
     pub fn with_history(mut self, history: Vec<f64>) -> Self {
         self.frame_history = history;
+        self
+    }
+
+    /// Attach the two statistics that need the whole retained window, and so
+    /// cannot be a single frame's reading.
+    #[must_use]
+    pub fn with_window(mut self, fps_window: f64, worst_ms: f64) -> Self {
+        self.fps_window = fps_window;
+        self.worst_ms = worst_ms;
+        self
+    }
+
+    /// Record whether the GPU time is a measurement or an absence of one.
+    #[must_use]
+    pub fn with_gpu_timing(mut self, available: bool) -> Self {
+        self.gpu_timing = available;
+        self
+    }
+
+    /// Attach the adapter list for the diagnostics note.
+    #[must_use]
+    pub fn with_adapters(mut self, adapters: String) -> Self {
+        self.adapters = adapters;
         self
     }
 
@@ -251,222 +311,102 @@ pub fn panel(ui: &mut Ui, state: &mut Uniforms, telemetry: &TelemetryView) -> Op
 }
 
 // ===========================================================================
-// Function table — hand-maintained mirror of `src/functions.rs`
+// Function table — derived from `src/functions.rs`
 // ===========================================================================
 //
-// KEEP IN SYNC WITH `FUNCTIONS` IN src/functions.rs.
-// `ids` are the shader's `switch` discriminants, written into
-// `Uniforms::func_id`. Changing one here without changing one there draws the
-// wrong map with no error anywhere. `tests::table_is_in_sync_with_the_library`
-// compares this table against the real one.
+// The rows, the ids and the groups all come from
+// `crate::complex::functions::FUNCTIONS`. `Uniforms::func_id` is written from
+// `FunctionEntry::id`, which is the number the shader switches on, so there is
+// no second copy of the dispatch table anywhere in this crate to fall out of
+// step with the shader. The two functions below that *are* defined here are
+// the presentation — where a group goes and what it says — and they are total
+// functions of the library's enum, so a new group cannot be added without
+// deciding how it looks.
 
-/// The kind of map, used purely to group the selector.
+/// Presentation order of the groups in the selector.
 ///
-/// Mirrors `functions::FunctionGroup` variant for variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum FunctionKind {
-    /// Powers, shifts, and the identity.
-    Polynomial,
-    /// Maps whose point is what happens when you iterate them.
-    Iterated,
-    /// Maps with a pole, `1/z` and friends.
-    Reciprocal,
-    /// `sin`, `cos`, `sinc`.
-    Trigonometric,
-    /// `sinh`, and by extension `cosh`/`tanh`.
-    Hyperbolic,
-    /// `e^z` and `e^{iz}`.
-    Exponential,
-    /// `log` and `sqrt`, where the branch cuts live.
-    Transcendental,
-    /// Linear fractional (Moebius) transformations.
-    Mobius,
-}
-
-impl FunctionKind {
-    /// Presentation order of the groups in the selector.
-    ///
-    /// Not the declaration order of the library's enum, and not the numeric
-    /// order of the ids: this is ordered by how a person thinks about picking
-    /// something, which is "start with the simple algebraic ones, then the
-    /// pole, then the transcendental, then the iterating ones".
-    pub const ORDER: [FunctionKind; 8] = [
-        FunctionKind::Polynomial,
-        FunctionKind::Iterated,
-        FunctionKind::Reciprocal,
-        FunctionKind::Trigonometric,
-        FunctionKind::Hyperbolic,
-        FunctionKind::Exponential,
-        FunctionKind::Transcendental,
-        FunctionKind::Mobius,
-    ];
-
-    /// The section heading shown above the group's rows.
-    pub const fn label(self) -> &'static str {
-        match self {
-            FunctionKind::Polynomial => "POLYNOMIAL",
-            FunctionKind::Iterated => "ITERATED",
-            FunctionKind::Reciprocal => "RECIPROCAL",
-            FunctionKind::Trigonometric => "TRIGONOMETRIC",
-            FunctionKind::Hyperbolic => "HYPERBOLIC",
-            FunctionKind::Exponential => "EXPONENTIAL",
-            FunctionKind::Transcendental => "TRANSCENDENTAL",
-            FunctionKind::Mobius => "MOEBIUS",
-        }
-    }
-
-    /// A one-line note explaining what the group is *for*.
-    ///
-    /// Shown under the selector for whichever function is selected. This is the
-    /// part that turns a list into an instrument: the names in the table are
-    /// terse on purpose, and the terseness needs paying back somewhere.
-    pub const fn note(self) -> &'static str {
-        match self {
-            FunctionKind::Polynomial => "algebraic: no iteration needed to see structure",
-            FunctionKind::Iterated => "iterate to resolve the fractal boundary",
-            FunctionKind::Reciprocal => "pole at 0; the plane folds through the origin",
-            FunctionKind::Trigonometric => "periodic in the real direction, unbounded above",
-            FunctionKind::Hyperbolic => "grows along the real axis, periodic on the imaginary",
-            FunctionKind::Exponential => "never returns; modulus encodes Re z",
-            FunctionKind::Transcendental => "branch cuts and boundary conditions dominate",
-            FunctionKind::Mobius => "linear fractional; acts on the Riemann sphere",
-        }
-    }
-}
-
-/// One row of the function selector.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FunctionRow {
-    /// Dispatch id written into [`Uniforms::func_id`].
-    pub id: u32,
-    /// Terse lowercase name, e.g. `"basilica"`.
-    pub name: &'static str,
-    /// Display formula, exactly as the library spells it.
-    pub formula: &'static str,
-    /// Which group this row belongs to.
-    pub kind: FunctionKind,
-}
-
-impl FunctionRow {
-    /// Case-insensitive substring match against the name, the formula, and the
-    /// bare id, so `"z3"`, `"3"`, `"cube"` and `"z^3"` all find the same row.
-    pub fn matches(&self, query: &str) -> bool {
-        let q = query.trim();
-        if q.is_empty() {
-            return true;
-        }
-        let q = q.to_ascii_lowercase();
-        self.name.contains(&q)
-            || self.formula.to_ascii_lowercase().contains(&q)
-            || self.id.to_string() == q
-            || self.kind.label().to_ascii_lowercase().contains(&q)
-    }
-}
-
-/// The 16 dispatchable maps, in `id` order.
+/// Not the declaration order of the library's enum, and not the numeric order
+/// of the ids: this is ordered by how a person thinks about picking something,
+/// which is "start with the simple algebraic ones, then the pole, then the
+/// transcendental, then the iterating ones".
 ///
-/// **Mirror of `functions::FUNCTIONS`.** See the file-level note.
-pub const FUNCTION_TABLE: [FunctionRow; 16] = [
-    FunctionRow {
-        id: 0,
-        name: "identity",
-        formula: "z",
-        kind: FunctionKind::Polynomial,
-    },
-    FunctionRow {
-        id: 1,
-        name: "square",
-        formula: "z^2",
-        kind: FunctionKind::Polynomial,
-    },
-    FunctionRow {
-        id: 2,
-        name: "cube",
-        formula: "z^3",
-        kind: FunctionKind::Polynomial,
-    },
-    FunctionRow {
-        id: 3,
-        name: "reciprocal",
-        formula: "1/z",
-        kind: FunctionKind::Reciprocal,
-    },
-    FunctionRow {
-        id: 4,
-        name: "z^2 - 1",
-        formula: "z^2 - 1",
-        kind: FunctionKind::Polynomial,
-    },
-    FunctionRow {
-        id: 5,
-        name: "z^3 - 1",
-        formula: "z^3 - 1",
-        kind: FunctionKind::Polynomial,
-    },
-    FunctionRow {
-        id: 6,
-        name: "basilica",
-        formula: "z^3 - 2z",
-        kind: FunctionKind::Iterated,
-    },
-    FunctionRow {
-        id: 7,
-        name: "sin",
-        formula: "sin z",
-        kind: FunctionKind::Trigonometric,
-    },
-    FunctionRow {
-        id: 8,
-        name: "cos",
-        formula: "cos z",
-        kind: FunctionKind::Trigonometric,
-    },
-    FunctionRow {
-        id: 9,
-        name: "sinc",
-        formula: "sin z / z",
-        kind: FunctionKind::Trigonometric,
-    },
-    FunctionRow {
-        id: 10,
-        name: "sinh",
-        formula: "sinh z",
-        kind: FunctionKind::Hyperbolic,
-    },
-    FunctionRow {
-        id: 11,
-        name: "exp",
-        formula: "e^z",
-        kind: FunctionKind::Exponential,
-    },
-    FunctionRow {
-        id: 12,
-        name: "log",
-        formula: "ln z",
-        kind: FunctionKind::Transcendental,
-    },
-    FunctionRow {
-        id: 13,
-        name: "sqrt",
-        formula: "sqrt z",
-        kind: FunctionKind::Transcendental,
-    },
-    FunctionRow {
-        id: 14,
-        name: "mobius",
-        formula: "(z - 1) / (z + 1)",
-        kind: FunctionKind::Mobius,
-    },
-    FunctionRow {
-        id: 15,
-        name: "julia",
-        formula: "z^2 + c",
-        kind: FunctionKind::Iterated,
-    },
+/// Every group that appears in [`FUNCTIONS`] must appear here, which
+/// `every_group_in_the_table_is_ordered_and_labelled` checks: a group
+/// missing from this list would render with no heading at all, which is the one
+/// failure a `match` cannot catch.
+pub const GROUP_ORDER: [FunctionGroup; 8] = [
+    FunctionGroup::Polynomial,
+    FunctionGroup::Iterated,
+    FunctionGroup::Reciprocal,
+    FunctionGroup::Trigonometric,
+    FunctionGroup::Hyperbolic,
+    FunctionGroup::Exponential,
+    FunctionGroup::Transcendental,
+    FunctionGroup::Mobius,
 ];
 
-/// Number of dispatchable functions. Mirrors `FUNCTIONS.len()`.
-pub const FUNCTION_COUNT: usize = FUNCTION_TABLE.len();
+/// The section heading shown above the group's rows.
+///
+/// Exhaustive over [`FunctionGroup`]: a new variant fails the build here rather
+/// than rendering under a heading nobody chose.
+pub fn group_label(group: FunctionGroup) -> &'static str {
+    match group {
+        FunctionGroup::Polynomial => "POLYNOMIAL",
+        FunctionGroup::Iterated => "ITERATED",
+        FunctionGroup::Reciprocal => "RECIPROCAL",
+        FunctionGroup::Trigonometric => "TRIGONOMETRIC",
+        FunctionGroup::Hyperbolic => "HYPERBOLIC",
+        FunctionGroup::Exponential => "EXPONENTIAL",
+        FunctionGroup::Transcendental => "TRANSCENDENTAL",
+        FunctionGroup::Mobius => "MOEBIUS",
+    }
+}
+
+/// A one-line note explaining what the group is *for*.
+///
+/// Shown under the selector for whichever function is selected. This is the
+/// part that turns a list into an instrument: the names in the table are terse
+/// on purpose, and the terseness needs paying back somewhere.
+///
+/// Exhaustive over [`FunctionGroup`], for the same reason as [`group_label`].
+pub fn group_note(group: FunctionGroup) -> &'static str {
+    match group {
+        FunctionGroup::Polynomial => "algebraic: no iteration needed to see structure",
+        FunctionGroup::Iterated => "iterate to resolve the fractal boundary",
+        FunctionGroup::Reciprocal => "pole at 0; the plane folds through the origin",
+        FunctionGroup::Trigonometric => "periodic in the real direction, unbounded above",
+        FunctionGroup::Hyperbolic => "grows along the real axis, periodic on the imaginary",
+        FunctionGroup::Exponential => "never returns; modulus encodes Re z",
+        FunctionGroup::Transcendental => "branch cuts and boundary conditions dominate",
+        FunctionGroup::Mobius => "linear fractional; acts on the Riemann sphere",
+    }
+}
+
+/// Case-insensitive substring match against the name, the formula, the bare id
+/// and the group heading, so `"z3"`, `"3"`, `"cube"`, `"z^3"` and
+/// `"trigonometric"` all find the rows a user means by any of them.
+pub fn entry_matches(entry: &FunctionEntry, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    let q = q.to_ascii_lowercase();
+    entry.name.contains(&q)
+        || entry.formula.to_ascii_lowercase().contains(&q)
+        || entry.id.to_string() == q
+        || group_label(entry.group).to_ascii_lowercase().contains(&q)
+}
+
+/// Number of functions matching `query`, for the `n/16` counter.
+///
+/// Counts the library's rows, so the counter cannot claim a total the selector
+/// does not have.
+pub fn match_count(query: &str) -> usize {
+    FUNCTIONS
+        .iter()
+        .filter(|entry| entry_matches(entry, query))
+        .count()
+}
 
 /// Narrowest the panel is designed to be, in points.
 ///
@@ -485,20 +425,6 @@ pub const FUNCTION_COUNT: usize = FUNCTION_TABLE.len();
 /// different file.
 #[allow(dead_code)]
 pub const MIN_PANEL_W: f32 = 236.0;
-
-/// Look up a selector row by dispatch id, or `None` if the id is out of range.
-///
-/// A `None` here means the uniform block holds an id the shader could never
-/// have produced, which the panel renders as an explicit `ID n/a` rather than
-/// silently highlighting the wrong row.
-pub fn row_for_id(id: u32) -> Option<&'static FunctionRow> {
-    FUNCTION_TABLE.get(id as usize)
-}
-
-/// Number of functions matching `query`, for the `n/16` counter.
-pub fn match_count(query: &str) -> usize {
-    FUNCTION_TABLE.iter().filter(|r| r.matches(query)).count()
-}
 
 // ===========================================================================
 // Layout constants
@@ -805,7 +731,9 @@ fn function_section(ui: &mut Ui, state: &mut Uniforms) {
                     .corner_radius(CornerRadius::same(Theme::RADIUS))
                     .inner_margin(Margin::symmetric(GUTTER, 3)),
             )
-            .hint_text("filter 16 maps by name, id or formula"),
+            .hint_text(format!(
+                "filter {FUNCTION_COUNT} maps by name, id or formula"
+            )),
     );
     if response.changed() {
         write_search(ui.ctx(), query.clone());
@@ -822,9 +750,11 @@ fn function_section(ui: &mut Ui, state: &mut Uniforms) {
     ui.add_space(3.0);
 
     // -- the list ---------------------------------------------------------
+    // Every count, row and id below comes from the library table, so the
+    // selector cannot offer a map the shader would not dispatch.
     let total = FUNCTION_COUNT;
     let hits = match_count(&query);
-    let selected_row = row_for_id(state.func_id).copied();
+    let selected_entry = crate::complex::functions::entry_for(state.func_id);
 
     egui::ScrollArea::vertical()
         .id_salt("steel_pulse_fn_list")
@@ -832,21 +762,20 @@ fn function_section(ui: &mut Ui, state: &mut Uniforms) {
         .auto_shrink([false, true])
         .show(ui, |ui| {
             let mut any = false;
-            for kind in FunctionKind::ORDER {
-                let matching: Vec<FunctionRow> = FUNCTION_TABLE
+            for group in GROUP_ORDER {
+                let matching: Vec<&'static FunctionEntry> = FUNCTIONS
                     .iter()
-                    .copied()
-                    .filter(|r| r.kind == kind && r.matches(&query))
+                    .filter(|entry| entry.group == group && entry_matches(entry, &query))
                     .collect();
                 if matching.is_empty() {
                     continue;
                 }
                 any = true;
-                group_heading(ui, kind.label());
-                for row in matching {
-                    let selected = state.func_id == row.id;
-                    if function_row(ui, &row, selected).clicked() {
-                        state.func_id = row.id;
+                group_heading(ui, group_label(group));
+                for entry in matching {
+                    let selected = state.func_id == entry.id;
+                    if function_row(ui, entry, selected).clicked() {
+                        state.func_id = entry.id;
                     }
                 }
                 ui.add_space(2.0);
@@ -869,15 +798,18 @@ fn function_section(ui: &mut Ui, state: &mut Uniforms) {
     ui.add_space(3.0);
 
     // -- what is selected --------------------------------------------------
-    match selected_row {
-        Some(row) => {
+    match selected_entry {
+        Some(entry) => {
             readout_row(
                 ui,
                 "SELECTED",
-                format!("[{:02}] {}", row.id, row.name),
+                format!("[{:02}] {}", entry.id, entry.name),
                 Theme::CYAN,
             );
-            note_line(ui, &format!("{}   {}", row.formula, row.kind.note()));
+            note_line(
+                ui,
+                &format!("{}   {}", entry.formula, group_note(entry.group)),
+            );
         }
         None => {
             readout_row(
@@ -940,20 +872,25 @@ fn function_section(ui: &mut Ui, state: &mut Uniforms) {
         );
     });
     ui.add_space(1.0);
-    note_line(ui, "16 - 4096, logarithmic; the cap mirrors the library");
+    note_line(
+        ui,
+        &format!("{MIN_ITER} - {MAX_ITER}, logarithmic; the cap is the library's own"),
+    );
 }
 
 /// Minimum iteration count offered by the slider. Below 16 nothing in the table
 /// resolves anything worth looking at, and a 4-step orbit is just a smear.
 const MIN_ITER: u32 = 16;
-/// Maximum iteration count, matching `functions::ITERATION_CAP`.
-const MAX_ITER: u32 = 4096;
+/// Maximum iteration count. The library's `ITERATION_CAP`, read rather than
+/// copied: the slider must not be able to offer a count the evaluator would
+/// clamp away, and a second literal here is exactly how that would happen.
+const MAX_ITER: u32 = crate::complex::functions::ITERATION_CAP;
 
-// The note printed under the slider spells the range out in words rather than
-// formatting the constants, because a string is a string. This assertion is
-// what stops the two from drifting: change the slider bounds and the build
-// fails until the sentence is updated too.
-const _: () = assert!(MIN_ITER == 16 && MAX_ITER == 4096);
+// The note printed under the slider spells the range out rather than being
+// hardcoded, because a string is a string and a number is not. This assertion
+// is what stops the *word* "16" from drifting away from `MIN_ITER`: change the
+// floor and the build fails until the sentence is updated too.
+const _: () = assert!(MIN_ITER == 16);
 
 // ===========================================================================
 // Section 3 — COLOR
@@ -1066,13 +1003,31 @@ fn telemetry_section(ui: &mut Ui, t: &TelemetryView) {
     // If a digit were proportional the entire right edge would shimmer.
     let status = t.status_color();
     readout_row(ui, "FPS", format!("{:.1}", t.fps), status);
+    // The windowed average beside the moving one. They agree on a healthy run
+    // and diverge exactly when the run is not, which is the whole point of
+    // showing both.
+    readout_row(
+        ui,
+        "FPS AVG",
+        format!("{:.1}", t.fps_window),
+        Theme::TEXT_DIM,
+    );
     readout_row(
         ui,
         "FRAME",
         format!("{:.2} ms", t.frame_ms),
         theme::status_color_from_frame_ms(t.frame_ms),
     );
-    readout_row(ui, "GPU", format!("{:.2} ms", t.gpu_ms), Theme::TEXT);
+    // The worst frame in the window. `FRAME` and `FPS` are both averages in
+    // some sense, and neither of them can see a single 200 ms stall; this can.
+    readout_row(ui, "WORST", format!("{:.2} ms", t.worst_ms), Theme::TEXT);
+    // `n/a` rather than `0.00 ms` when the adapter has no timestamp query:
+    // nobody measured it, which is not the same as it being free.
+    if t.gpu_timing {
+        readout_row(ui, "GPU", format!("{:.2} ms", t.gpu_ms), Theme::TEXT);
+    } else {
+        readout_row(ui, "GPU", "n/a".to_owned(), Theme::TEXT_FAINT);
+    }
     readout_row(ui, "CPU", format!("{:.2} ms", t.cpu_ms), Theme::TEXT);
     readout_row(ui, "GPU SHARE", gpu_share(t), Theme::TEXT_DIM);
     readout_row(
@@ -1082,6 +1037,21 @@ fn telemetry_section(ui: &mut Ui, t: &TelemetryView) {
         Theme::TEXT,
     );
     readout_row(ui, "RAMP", ramp_caption(t.fps), Theme::TEXT_FAINT);
+
+    // Diagnostics. The masthead names the adapter eframe picked; this is every
+    // adapter wgpu could see, which is the first thing anyone needs in a bug
+    // report and the only place the ones that were *not* picked are visible.
+    // Newlines become separators so the note stays a wrapped line rather than
+    // a list that fights the panel's row rhythm.
+    ui.add_space(2.0);
+    if t.adapters.is_empty() {
+        note_line(ui, "adapters: not reported (no GPU renderer)");
+    } else {
+        note_line(
+            ui,
+            &format!("adapters: {}", t.adapters.replace('\n', " · ")),
+        );
+    }
 }
 
 /// The frame-time sparkline.
@@ -1552,7 +1522,7 @@ fn state_chip(ui: &mut Ui, label: &str, on: bool, accent: Option<Color32>) -> eg
 /// needs its own dim column so that a glance at the left edge is a list of
 /// dispatch numbers, and the selected state needs a left tick plus a dim
 /// wash rather than egui's flat selection colour.
-fn function_row(ui: &mut Ui, row: &FunctionRow, selected: bool) -> egui::Response {
+fn function_row(ui: &mut Ui, entry: &FunctionEntry, selected: bool) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), FN_ROW_H), Sense::click());
 
@@ -1572,7 +1542,7 @@ fn function_row(ui: &mut Ui, row: &FunctionRow, selected: bool) -> egui::Respons
         p.text(
             pos2(rect.left() + 6.0, cy),
             Align2::LEFT_CENTER,
-            format!("{:02}", row.id),
+            format!("{:02}", entry.id),
             label_font(),
             if selected {
                 Theme::CYAN_DIM
@@ -1583,14 +1553,14 @@ fn function_row(ui: &mut Ui, row: &FunctionRow, selected: bool) -> egui::Respons
         p.text(
             pos2(rect.left() + 24.0, cy),
             Align2::LEFT_CENTER,
-            row.name,
+            entry.name,
             value_font(),
             name_color,
         );
         p.text(
             pos2(rect.right() - 6.0, cy),
             Align2::RIGHT_CENTER,
-            row.formula,
+            entry.formula,
             label_font(),
             if selected {
                 Theme::TEXT_DIM
@@ -1675,82 +1645,75 @@ fn write_search(ctx: &egui::Context, value: String) {
 mod tests {
     use super::*;
 
-    /// The one test that actually matters: this hand-maintained mirror must
-    /// agree with the library, id for id, name for name, formula for formula.
+    /// The panel's own table is gone, so there is nothing left to compare it
+    /// against: this asserts the *derivation* instead. Every row the selector
+    /// can draw is a library row, every library group is ordered and labelled
+    /// for display, and nothing is displayed twice.
+    ///
+    /// This is the replacement for the old `table_is_in_sync_with_the_library`.
+    /// That test existed to catch a hand-maintained mirror drifting from the
+    /// library, which cannot happen when there is no second copy; what it
+    /// could not catch — a group the selector had no heading for — is what this
+    /// one covers.
     #[test]
-    fn table_is_in_sync_with_the_library() {
-        use crate::complex::functions::{FunctionEntry, FUNCTIONS};
-
-        assert_eq!(
-            FUNCTION_TABLE.len(),
-            FUNCTIONS.len(),
-            "panel::FUNCTION_TABLE and functions::FUNCTIONS disagree on length"
-        );
-
-        for (panel_row, lib_row) in FUNCTION_TABLE.iter().zip(FUNCTIONS.iter()) {
-            let FunctionEntry {
-                id,
-                name,
-                formula,
-                group,
-            } = lib_row;
-            assert_eq!(panel_row.id, *id, "id mismatch");
-            assert_eq!(panel_row.name, *name, "name mismatch for id {id}");
-            // Compared with whitespace collapsed. The formula is a human-facing
-            // label, and `"(z - 1) / (z + 1)"` and `"(z - 1) / (z+1)"` are the
-            // same expression written with different spacing. A character-exact
-            // comparison here fails on cosmetics while teaching the reader that
-            // spacing is load-bearing, which is the opposite of what this test
-            // is for. A genuinely different formula still fails.
-            let normalise = |s: &str| s.split_whitespace().collect::<String>();
-            assert_eq!(
-                normalise(panel_row.formula),
-                normalise(formula),
-                "formula mismatch for id {id}"
-            );
-            assert_eq!(
-                panel_row.kind,
-                mirror_group(*group),
-                "group mismatch for id {id}"
+    fn every_group_in_the_table_is_ordered_and_labelled() {
+        // Every group present in the library is listed in GROUP_ORDER, once.
+        for group in GROUP_ORDER {
+            assert!(
+                FUNCTIONS.iter().any(|entry| entry.group == group),
+                "group {group:?} is in GROUP_ORDER but has no members, so it \
+                 never renders and its heading is dead weight"
             );
         }
-    }
 
-    /// Translate the library's group enum into the panel's, failing loudly if
-    /// the library grows a variant nobody mirrored.
-    fn mirror_group(g: crate::complex::functions::FunctionGroup) -> FunctionKind {
-        use crate::complex::functions::FunctionGroup as G;
-        match g {
-            G::Polynomial => FunctionKind::Polynomial,
-            G::Iterated => FunctionKind::Iterated,
-            G::Reciprocal => FunctionKind::Reciprocal,
-            G::Trigonometric => FunctionKind::Trigonometric,
-            G::Hyperbolic => FunctionKind::Hyperbolic,
-            G::Exponential => FunctionKind::Exponential,
-            G::Transcendental => FunctionKind::Transcendental,
-            G::Mobius => FunctionKind::Mobius,
+        // ...and nothing in the library is missing from it. `GROUP_ORDER` is a
+        // fixed-size array, so a new group cannot be added to it without
+        // growing it, and growing it without adding the group would be the
+        // failure: a row rendering with no heading above it.
+        for entry in FUNCTIONS.iter() {
+            assert!(
+                GROUP_ORDER.contains(&entry.group),
+                "group {:?} has members but is not in GROUP_ORDER",
+                entry.group
+            );
+        }
+
+        // Every group is presentable, which is what makes the loop above
+        // total: the `match`es in `group_label`/`group_note` are exhaustive by
+        // construction, and these prove the answers are not placeholders.
+        for group in GROUP_ORDER {
+            assert!(!group_label(group).is_empty(), "{group:?} has no heading");
+            assert!(!group_note(group).is_empty(), "{group:?} has no note");
         }
     }
 
     /// Ids must be exactly `0..N` and dense, because the shader switches on
     /// them and a gap would fall through to a default case.
+    ///
+    /// The panel's own id lookup is the library's `entry_for`, so what is worth
+    /// asserting is the contract the selector relies on: the id in the table is
+    /// the index, and an id outside the table resolves to nothing rather than to
+    /// the wrong row.
     #[test]
     fn ids_are_dense_and_sequential() {
-        for (i, row) in FUNCTION_TABLE.iter().enumerate() {
-            assert_eq!(row.id as usize, i, "id {i} is out of order");
+        for (i, entry) in FUNCTIONS.iter().enumerate() {
+            assert_eq!(entry.id as usize, i, "id {i} is out of order");
         }
-        assert_eq!(row_for_id(16), None);
-        assert_eq!(row_for_id(15).map(|r| r.name), Some("julia"));
+        assert_eq!(crate::complex::functions::entry_for(FUNCTION_COUNT), None);
+        assert_eq!(
+            crate::complex::functions::entry_for(15).map(|e| e.name),
+            Some("julia")
+        );
     }
 
     /// Every group must be non-empty, or a heading appears with nothing under
     /// it.
     #[test]
     fn every_group_has_members() {
-        for kind in FunctionKind::ORDER {
+        for group in GROUP_ORDER {
             assert!(
-                FUNCTION_TABLE.iter().any(|r| r.kind == kind),
-                "group {kind:?} is empty"
+                FUNCTIONS.iter().any(|e| e.group == group),
+                "group {group:?} is empty"
             );
         }
     }
@@ -1765,7 +1728,7 @@ mod tests {
         assert_eq!(match_count("z^3"), 3, "z^3, z^3 - 1 and z^3 - 2z");
         assert_eq!(match_count("5"), 1, "bare id 5");
         assert_eq!(match_count("trigonometric"), 3);
-        assert_eq!(match_count(""), FUNCTION_COUNT);
+        assert_eq!(match_count(""), FUNCTIONS.len());
         assert_eq!(match_count("definitely-not-a-function"), 0);
     }
 
@@ -1899,15 +1862,27 @@ mod tests {
             resolution: [2560, 1440],
             backend: String::from("Metal"),
             frame_history: vec![16.0, 16.4, 17.1],
+            fps_window: 59.8,
+            worst_ms: 18.2,
+            gpu_timing: true,
+            adapters: String::from("Apple M-series / Metal / Discrete"),
         };
         assert_eq!(t.resolution[1], 1440);
         assert_eq!(t.status_color(), Theme::GREEN);
+        assert_eq!(t.worst_ms, 18.2);
+        assert!(t.gpu_timing);
 
         // And via the constructor, which is the form the app layer will use.
         let t2 = TelemetryView::new(30.0, 33.3, 30.0, 3.3, [800, 600], String::from("Vulkan"))
-            .with_history(vec![33.0]);
+            .with_history(vec![33.0])
+            .with_window(29.0, 41.0)
+            .with_gpu_timing(false)
+            .with_adapters(String::from("Vulkan / llvmpipe / Cpu"));
         assert_eq!(t2.backend, "Vulkan");
         assert_eq!(t2.frame_history.len(), 1);
+        assert_eq!(t2.fps_window, 29.0);
+        assert!(!t2.gpu_timing);
+        assert_eq!(t2.adapters, "Vulkan / llvmpipe / Cpu");
 
         // Struct-literal construction with defaults.
         let t3 = TelemetryView {
@@ -1916,6 +1891,8 @@ mod tests {
         };
         assert_eq!(t3.resolution, [0, 0]);
         assert!(t3.frame_history.is_empty());
+        assert_eq!(t3.worst_ms, 0.0);
+        assert!(t3.adapters.is_empty());
 
         // PanelAction is a plain fieldless enum: matchable and Copy.
         let a = PanelAction::RandomizeJulia;
@@ -1926,23 +1903,18 @@ mod tests {
             "ResetColor".to_owned()
         );
 
-        // FunctionRow is a plain record.
-        let row = FunctionRow {
-            id: 0,
-            name: "identity",
-            formula: "z",
-            kind: FunctionKind::Polynomial,
-        };
-        assert!(row.matches(""));
-        assert!(row.matches("IDENT"));
+        // The selector's rows are the library's, read rather than restated.
+        let entry = crate::complex::functions::entry_for(0).expect("id 0 exists");
+        assert!(entry_matches(entry, ""));
+        assert!(entry_matches(entry, "IDENT"));
+        assert!(!entry_matches(entry, "sinc"));
 
         // And the free functions.
-        assert_eq!(row_for_id(7).map(|r| r.name), Some("sin"));
         assert_eq!(match_count("polynomial"), 5);
         assert_eq!(FUNCTION_COUNT, 16);
-        assert_eq!(FUNCTION_TABLE[9].name, "sinc");
-        assert_eq!(FunctionKind::Mobius.label(), "MOEBIUS");
-        assert_eq!(FunctionKind::ORDER.len(), 8);
+        assert_eq!(FUNCTIONS[9].name, "sinc");
+        assert_eq!(group_label(FunctionGroup::Mobius), "MOEBIUS");
+        assert_eq!(GROUP_ORDER.len(), 8);
         let _ = search_state_id();
         let _ = seed_state_id();
     }
@@ -2042,6 +2014,12 @@ mod tests {
                 resolution: [0, 0],
                 backend: String::new(),
                 frame_history: vec![f64::NAN, f64::INFINITY, -1.0, 0.0, 1.0e12],
+                fps_window: f64::NAN,
+                worst_ms: f64::INFINITY,
+                gpu_timing: false,
+                // Newlines included, because the adapter list is a multi-line
+                // string in the renderer and the diagnostics note has to cope.
+                adapters: String::from("first / Metal / Cpu\nsecond / Vulkan / Cpu"),
             };
             run_frame(220.0, &mut u, &t, true);
             run_frame(220.0, &mut u, &t, false);

@@ -37,6 +37,14 @@
 //!   128-element allocation per frame, about 512 bytes, once per 16 ms: roughly
 //!   0.02% of the frame budget, and invisible next to the work already being
 //!   done. Correctness and borrow ergonomics win a trade that cheap.
+//! * **There is exactly one way to read a number.** [`Telemetry::snapshot`] is
+//!   the only read path, and the per-field accessors that used to duplicate it
+//!   (`frame_ms`, `cpu_ms`, `gpu_ms`, `fps_instant`, `sample_count`) are gone.
+//!   Two ways to read one value is two values that can disagree, and a
+//!   statistics type whose point is to be believed should not have that. The
+//!   statistics that are *not* in the snapshot — the windowed frame rate and
+//!   whether a GPU timestamp has ever landed — keep their own accessors, because
+//!   they are derived on demand rather than stored.
 
 /// Number of frame durations retained by default.
 ///
@@ -137,12 +145,6 @@ impl FrameHistory {
     /// Whether no frame has been recorded yet.
     pub fn is_empty(&self) -> bool {
         self.len == 0
-    }
-
-    /// Total number of samples the ring can hold: always
-    /// [`FRAME_HISTORY_CAPACITY`].
-    pub fn capacity(&self) -> usize {
-        Self::CAPACITY
     }
 
     /// Iterates the retained durations in milliseconds, **oldest first**.
@@ -370,22 +372,18 @@ impl Telemetry {
         self.gpu_timing_seen
     }
 
-    /// Instantaneous frame rate in frames per second: an exponential moving
-    /// average of `1 / dt`. `0.0` before the first frame.
-    ///
-    /// This is the value in [`TelemetrySnapshot::fps`].
-    pub fn fps_instant(&self) -> f64 {
-        self.fps_instant
-    }
-
     /// Windowed average frame rate in frames per second, taken over the whole
     /// retained history. `0.0` when empty.
     ///
     /// The reciprocal of the mean frame time, so a single 200 ms stall in the
     /// window pulls it down exactly as much as 12 good frames would - which is
     /// the point. It is the number to quote when comparing runs; compare it
-    /// against [`Telemetry::fps_instant`] and the gap between them is the
+    /// against [`TelemetrySnapshot::fps`] and the gap between them is the
     /// jitter.
+    ///
+    /// Not in the snapshot because it is derived from the whole ring on demand
+    /// rather than carried from frame to frame, and recomputing it once per
+    /// frame is far cheaper than storing a number that can go stale.
     pub fn fps_average(&self) -> f64 {
         let mean = self.history.mean_ms();
         if mean > 0.0 {
@@ -395,30 +393,14 @@ impl Telemetry {
         }
     }
 
-    /// Wall-clock duration of the last completed frame in milliseconds.
-    pub fn frame_ms(&self) -> f64 {
-        self.frame_ms
-    }
-
-    /// CPU cost of the frame in flight or just completed, in milliseconds.
-    pub fn cpu_ms(&self) -> f64 {
-        self.cpu_ms
-    }
-
-    /// GPU cost of the frame in flight or just completed, in milliseconds.
-    pub fn gpu_ms(&self) -> f64 {
-        self.gpu_ms
-    }
-
     /// Longest frame in the retained window in milliseconds, or `0.0` when
     /// empty.
+    ///
+    /// The same value as [`TelemetrySnapshot::worst_frame_ms`]; kept as an
+    /// accessor because the panel asks for it beside the frame rate rather than
+    /// unpacking a whole snapshot for two numbers.
     pub fn worst_frame_ms(&self) -> f64 {
         f64::from(self.history.worst_ms())
-    }
-
-    /// Number of retained frame samples.
-    pub fn sample_count(&self) -> usize {
-        self.history.len()
     }
 
     /// The oscilloscope ring, for the panel to plot.
@@ -453,6 +435,14 @@ impl Telemetry {
     ///
     /// For "reset the benchmark" in the UI, and after a stall that should not
     /// colour the next window.
+    ///
+    /// `#[allow(dead_code)]`: no caller yet. The panel has no "reset the
+    /// benchmark" command — a new [`crate::panel::PanelAction`] would be the
+    /// thing that called this, and inventing a button for it is a UI decision
+    /// rather than a correctness fix, so the method stays. It is not dead
+    /// weight: `FrameHistory::clear` has no other caller either, and the pair
+    /// is the only way to rewind this tracker without dropping it.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.history.clear();
         self.frame_start = None;
@@ -524,7 +514,6 @@ mod tests {
         let history = FrameHistory::new();
         assert!(history.is_empty());
         assert_eq!(history.len(), 0);
-        assert_eq!(history.capacity(), 128);
         assert_eq!(history.iter().count(), 0);
     }
 
@@ -645,7 +634,6 @@ mod tests {
         let mut b = Telemetry::default();
         fill(&mut b, 0.01, 4);
         assert_eq!(a.snapshot(), b.snapshot());
-        assert_eq!(a.fps_instant(), b.fps_instant());
     }
 
     #[test]
@@ -662,7 +650,7 @@ mod tests {
         for value in [s.fps, s.frame_ms, s.cpu_ms, s.gpu_ms, s.worst_frame_ms] {
             assert!(value.is_finite(), "{value} is not finite");
         }
-        assert!(telemetry.fps_instant().is_finite());
+        assert!(s.fps.is_finite());
         assert!(telemetry.fps_average().is_finite());
         assert_eq!(telemetry.fps_average(), 0.0);
         assert!(!telemetry.has_gpu_timing());
@@ -712,7 +700,7 @@ mod tests {
     fn worst_frame_zero_before_any_frame() {
         let telemetry = Telemetry::new();
         assert_eq!(telemetry.worst_frame_ms(), 0.0);
-        assert_eq!(telemetry.sample_count(), 0);
+        assert_eq!(telemetry.snapshot().sample_count, 0);
     }
 
     #[test]
@@ -724,26 +712,27 @@ mod tests {
 
         assert!(ms >= 3.0, "4 ms sleep reported {ms} ms");
         assert!(ms < 1000.0, "implausible frame time {ms} ms");
-        assert_eq!(telemetry.sample_count(), 1);
+        assert_eq!(telemetry.snapshot().sample_count, 1);
         assert_close(
-            telemetry.frame_ms(),
+            telemetry.snapshot().frame_ms,
             ms,
             1e-12,
             "frame_ms mirrors end_frame",
         );
         assert_close(telemetry.history.mean_ms(), ms, 1e-3, "sample recorded");
-        assert!(telemetry.fps_instant() > 0.0 && telemetry.fps_instant().is_finite());
+        let fps = telemetry.snapshot().fps;
+        assert!(fps > 0.0 && fps.is_finite());
     }
 
     #[test]
     fn end_frame_without_begin_frame_records_nothing() {
         let mut telemetry = Telemetry::new();
         assert_eq!(telemetry.end_frame(), 0.0);
-        assert_eq!(telemetry.sample_count(), 0);
+        assert_eq!(telemetry.snapshot().sample_count, 0);
         // And the tracker is still usable afterwards.
         telemetry.begin_frame();
         assert!(telemetry.end_frame() >= 0.0);
-        assert_eq!(telemetry.sample_count(), 1);
+        assert_eq!(telemetry.snapshot().sample_count, 1);
     }
 
     #[test]
@@ -756,7 +745,7 @@ mod tests {
         // exactly 1/dt. Ramping would make the first second of every run read
         // as a ramp from nothing, which is exactly when it is being watched.
         assert_close(
-            telemetry.fps_instant(),
+            telemetry.snapshot().fps,
             1000.0 / first_ms,
             1e-6,
             "seeded fps",
@@ -778,7 +767,7 @@ mod tests {
         let alpha = fps_blend(second_ms / 1000.0);
         assert!((0.0..1.0).contains(&alpha), "blend {alpha} out of range");
         assert_close(
-            telemetry.fps_instant(),
+            telemetry.snapshot().fps,
             start + (target - start) * alpha,
             1e-9,
             "smoothed fps",
@@ -820,8 +809,6 @@ mod tests {
         let s = telemetry.snapshot();
         assert_close(s.cpu_ms, 0.25, 1e-9, "cpu_ms");
         assert_close(s.gpu_ms, 1.8, 1e-9, "gpu_ms");
-        assert_close(telemetry.cpu_ms(), 0.25, 1e-9, "cpu_ms accessor");
-        assert_close(telemetry.gpu_ms(), 1.8, 1e-9, "gpu_ms accessor");
         assert!(telemetry.has_gpu_timing());
     }
 
@@ -834,11 +821,12 @@ mod tests {
         telemetry.record_cpu_time(Duration::from_millis(2));
         telemetry.record_gpu_time(Duration::from_millis(3));
         telemetry.end_frame();
-        assert_close(telemetry.cpu_ms(), 2.0, 1e-9, "cpu reported");
+        assert_close(telemetry.snapshot().cpu_ms, 2.0, 1e-9, "cpu reported");
 
         telemetry.begin_frame();
-        assert_eq!(telemetry.cpu_ms(), 0.0, "cpu must be cleared");
-        assert_eq!(telemetry.gpu_ms(), 0.0, "gpu must be cleared");
+        let cleared = telemetry.snapshot();
+        assert_eq!(cleared.cpu_ms, 0.0, "cpu must be cleared");
+        assert_eq!(cleared.gpu_ms, 0.0, "gpu must be cleared");
     }
 
     #[test]
@@ -853,7 +841,7 @@ mod tests {
         fill(&mut telemetry, 0.200, 4);
         assert_eq!(snapshot.history.len(), 8, "snapshot aliased the ring");
         assert_close(f64::from(snapshot.history[0]), 10.0, 1e-3, "first sample");
-        assert_eq!(telemetry.sample_count(), 12);
+        assert_eq!(telemetry.snapshot().sample_count, 12);
     }
 
     #[test]
@@ -876,16 +864,19 @@ mod tests {
         }
     }
 
+    /// The snapshot is the only read path, so this is the test that it agrees
+    /// with the *ring* underneath it and with the accessors that are still
+    /// worth having: the sample count, the worst frame and the trace must all
+    /// describe the same window.
     #[test]
-    fn snapshot_agrees_with_the_accessors() {
+    fn snapshot_agrees_with_the_ring() {
         let mut telemetry = Telemetry::new();
         fill(&mut telemetry, 0.020, FrameHistory::CAPACITY);
         telemetry.history.push(0.400);
         let s = telemetry.snapshot();
-        assert_eq!(s.sample_count, telemetry.sample_count());
+        assert_eq!(s.sample_count, telemetry.history().len());
         assert_eq!(s.history.len(), telemetry.history().iter().count());
         assert_close(s.worst_frame_ms, telemetry.worst_frame_ms(), 1e-12, "worst");
-        assert_close(s.fps, telemetry.fps_instant(), 1e-12, "fps");
         assert_close(s.fps, 0.0, 1e-12, "no real frames means no fps yet");
     }
 
@@ -902,7 +893,7 @@ mod tests {
         let s = telemetry.snapshot();
         assert_eq!(s, TelemetrySnapshot::default());
         assert_eq!(s.sample_count, 0);
-        assert_eq!(telemetry.fps_instant(), 0.0);
+        assert_eq!(s.fps, 0.0);
         assert_eq!(telemetry.fps_average(), 0.0);
         assert!(!telemetry.has_gpu_timing());
         // Still usable afterwards.

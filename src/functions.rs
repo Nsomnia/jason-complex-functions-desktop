@@ -54,6 +54,26 @@
 //! | 14 | mobius | `(z - 1) / (z+1)` | Mobius |
 //! | 15 | julia | `z^2 + c` | Iterated |
 
+//! # Why this module is partly `#[allow(dead_code)]`
+//!
+//! The *table* here is live: `src/panel.rs` derives its selector rows from
+//! `FUNCTIONS`, and the plot's corner readout calls `label_for`, so the ids,
+//! names, formulas and groups are what the application dispatches on and
+//! displays. The *evaluator* — `eval`, `apply_once` and the constants only it
+//! reads — is not, and is not supposed to be: nothing on the CPU evaluates these
+//! functions, because the GPU is the thing that draws. The `f64` code exists to
+//! be the oracle the WGSL is checked against, and the only caller of an oracle is
+//! the test suite.
+//!
+//! So this is a deliberate, narrow suppression of one module rather than a
+//! blanket one: the lint's complaint is that `rustc` cannot see the tests from a
+//! binary crate, which is true and is not a defect in the code. What is **not**
+//! covered by that sentence is anything new added to this file without a caller —
+//! a new helper must be wired into the panel, used by `eval`, or deleted. Do not
+//! add to this file on the strength of the attribute below.
+
+#![allow(dead_code)]
+
 use crate::complex::Complex;
 
 /// How a function is presented in the control panel, and how the tests group
@@ -176,10 +196,7 @@ pub const SINC_SINGULARITY_GUARD_RADIUS: f64 = 1e-12;
 /// reasonable substitute; it is a visual preference, not a correctness one.
 ///
 /// Keep this constant in step with `JULIA_C` in `shaders/domain_coloring.wgsl`.
-const JULIA_C: Complex = Complex {
-    re: -0.75,
-    im: 0.0,
-};
+const JULIA_C: Complex = Complex { re: -0.75, im: 0.0 };
 
 /// Function id: `z`, the identity.
 const ID_IDENTITY: u32 = 0;
@@ -313,10 +330,10 @@ pub const FUNCTIONS: [FunctionEntry; 16] = [
     FunctionEntry {
         id: ID_MOBIUS,
         name: "mobius",
-        // The spacing here is `(z+1)` rather than `(z + 1)`: `src/panel.rs`
-        // keeps a hand-maintained mirror of this table and asserts the formula
-        // strings agree character for character, so this string is a contract
-        // with that file as well as with the shader.
+        // The spacing here is `(z+1)` rather than `(z + 1)`. This is a display
+        // string, never parsed, and the same string is what `src/panel.rs` and
+        // the plot's corner readout display: the panel no longer keeps its own
+        // copy, so there is nothing to keep in step with it any more.
         formula: "(z - 1) / (z+1)",
         group: FunctionGroup::Mobius,
     },

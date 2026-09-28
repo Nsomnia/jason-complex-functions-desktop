@@ -182,6 +182,13 @@ const WGPU_VERSION_LABEL: &str = "30.0.1";
 ///
 /// `wgpu::QUERY_SIZE`; re-declared through a named constant so the readback
 /// buffer size below reads as arithmetic rather than as a magic number.
+///
+/// `#[allow(dead_code)]`: only [`Renderer::enable_timestamps`] — itself
+/// deliberately uncalled, see its documentation — reads this, so liveness
+/// analysis reports it alongside that method. Kept rather than inlined at the
+/// one use site because the *reason* the buffer is two queries wide belongs
+/// next to the size of one.
+#[allow(dead_code)]
 const TIMESTAMP_QUERY_BYTES: u64 = wgpu::QUERY_SIZE as u64;
 
 // ---------------------------------------------------------------------------
@@ -198,12 +205,24 @@ const TIMESTAMP_QUERY_BYTES: u64 = wgpu::QUERY_SIZE as u64;
 /// There is no `NoAdapter` or `DeviceRequest` variant any more: eframe already
 /// requested the adapter and the device before this module is ever reached, and
 /// a failure there is an eframe startup failure with its own error.
+///
+/// `#[allow(dead_code)]` on both variants: `Renderer::new` reaches neither
+/// today. wgpu 30 runs Naga's WGSL front-end inside `create_shader_module` and
+/// reports through the uncaptured-error handler, so there is no `Result` here to
+/// convert. The variants are kept because each carries the one message a user
+/// can act on — "eframe was built with `glow`" and "your WGSL does not
+/// compile" — and because `Renderer::new` is documented to return them. What
+/// would use them: pushing a wgpu error scope around the pipeline creation in
+/// `Renderer::new` and returning its result, which needs a blocking poll of the
+/// immutable `Device` API and so is a deliberate piece of work rather than a
+/// side effect of tidying up warnings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RendererError {
     /// The `AdapterInfo` could not be read, or the supplied state was
     /// inconsistent. In practice this means the render state did not come from a
     /// live wgpu adapter.
+    #[allow(dead_code)]
     UnusableRenderState {
         /// Human-readable cause.
         cause: String,
@@ -212,6 +231,7 @@ pub enum RendererError {
     /// [`COMPUTE_SHADER_SRC`] or a binding layout that no longer matches the
     /// table at the top of this file. The underlying wgpu diagnostic is in
     /// `cause`.
+    #[allow(dead_code)]
     PipelineCreation {
         /// Human-readable cause.
         cause: String,
@@ -977,12 +997,6 @@ impl Renderer {
         self.adapter_list.clone()
     }
 
-    /// The uniform buffer, for tests and for debug tooling that wants to read
-    /// back what the last frame uploaded.
-    pub fn uniform_buffer(&self) -> &wgpu::Buffer {
-        &self.uniform_buffer
-    }
-
     /// Reads the plot image back off the GPU and encodes it as a binary PPM (P6).
     ///
     /// This exists because verifying a rendered frame in this environment is
@@ -1282,6 +1296,17 @@ impl Renderer {
     /// lacks, so a hard request would stop the app from starting on a machine
     /// that could otherwise run it perfectly well. The feature check here is the
     /// honest version of that gate, applied as late as the immutable API allows.
+    ///
+    /// `#[allow(dead_code)]`: no caller, and deliberately so. This returns
+    /// `false` on every launch today, because eframe builds the device with
+    /// `required_features = Features::empty()`; the only way to make it return
+    /// `true` is for the app layer to replace eframe's `device_descriptor`,
+    /// which means restating egui-wgpu's own limits and features by hand on
+    /// every eframe upgrade. That is a device-creation change on a pipeline that
+    /// currently works, not a dead-code fix, so it is left as the documented
+    /// opt-in it has always been. The panel reads the consequence honestly: it
+    /// prints `n/a` for GPU time rather than a confident `0.00 ms`.
+    #[allow(dead_code)]
     pub fn enable_timestamps(&mut self) -> bool {
         if self.timestamp_query_set.is_some() {
             return true;
