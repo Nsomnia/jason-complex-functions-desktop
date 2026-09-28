@@ -66,6 +66,37 @@ Nothing. Every lane that had a file in flight has landed it.
 
 ### Todo
 
+- [ ] **The theme is garbage and the font is terribly hard to read. This is the
+      top item in milestone 1.** Reported directly after running the built app:
+      the typography is illegible, the on-screen key legend cannot be
+      deciphered, and the theme as a whole does not work. Treat this as a real
+      defect, not a nitpick — a control panel nobody can read is not a control
+      panel.
+
+      What is known to be wrong, and what is not yet diagnosed:
+      - **Type size and weight.** Section headings, labels and values are too
+        small and too low-contrast against the near-black background. The
+        `TEXT` / `TEXT_DIM` / `TEXT_FAINT` ramp in `src/theme.rs` is too
+        compressed at the dim end.
+      - **The key legend is unusable.** The HUD in `src/app.rs::draw_plot_hud`
+        prints `drag to pan · wheel to zoom · R to reset` in 12 px monospace
+        with no background plate, so it sits directly on the plot image and
+        has no contrast guarantee at all. The same applies to the screenshot
+        notice next to it.
+      - **The theme was never reviewed against a real frame.** It was built
+        from a written description, and it has been seen exactly once, briefly,
+        by someone who reported back only that it did not look right. The
+        palette, the density, and the information hierarchy are all unvalidated.
+
+      Required to close this out: render the UI, look at it, and fix it. Note
+      that the GPU readback path (`STEEL_PULSE_CAPTURE=1`) does **not** help
+      here — it captures the compute output only, not the egui layer — so this
+      needs a human looking at the window, or a different capture mechanism.
+      Do not try to judge typography from source code. Judge it from pixels.
+
+      This is a theme/typography pass over `src/theme.rs` and `src/panel.rs`,
+      not a renderer change. Nothing about the compute pipeline is implicated.
+
 - [ ] **`src/app.rs` — the integration step, and the last thing standing.**
       It is the **only** remaining compile error in the crate: `src/main.rs:30`
       calls `app::run()` and `src/app.rs` is a one-line placeholder. Write it
