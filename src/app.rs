@@ -69,7 +69,7 @@ pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("STEEL-PULSE v2.0-TURBO")
-            .with_inner_size([1280.0, 820.0])
+            .with_inner_size([1440.0, 980.0])
             .with_min_inner_size([640.0, 480.0]),
         ..Default::default()
     };
@@ -133,6 +133,13 @@ struct Core {
     /// When the previous frame began, for the frame delta. `None` on the very
     /// first frame.
     last_frame_start: Option<Instant>,
+    /// A screenshot has been asked for and the readback is still in flight.
+    /// The readback is non-blocking, so this persists across frames until the
+    /// GPU copy actually lands.
+    screenshot_requested: bool,
+    /// Where the most recent screenshot went, or why it failed. Shown as a
+    /// transient overlay in the plot area.
+    last_screenshot: Option<String>,
 }
 
 /// The subset of [`Uniforms`] plus the target size that determines what the
@@ -191,6 +198,8 @@ impl Core {
             pending_action: None,
             size_dirty: true,
             last_frame_start: None,
+            screenshot_requested: false,
+            last_screenshot: None,
         }
     }
 
@@ -227,11 +236,50 @@ impl Core {
                     .set_target(0.0, 0.0, crate::camera::DEFAULT_SCALE);
             }
             PanelAction::Screenshot => {
-                // Saving a frame means reading the storage texture back to the
-                // CPU and encoding a PNG, neither of which belongs in this
-                // file's frame path. Deferred to a follow-up; the action is
-                // matched so it cannot fall through silently.
+                self.screenshot_requested = true;
             }
+        }
+    }
+
+    /// Perform a requested screenshot, if one is pending.
+    ///
+    /// The readback is non-blocking on the GPU side: [`Renderer::read_ppm`]
+    /// returns `None` until the copy has landed, so this is retried across
+    /// frames rather than stalling the UI thread waiting for it. The plot
+    /// carries on rendering throughout.
+    fn service_screenshot(&mut self) {
+        if !self.screenshot_requested {
+            return;
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            self.screenshot_requested = false;
+            return;
+        };
+        let Some(ppm) = renderer.read_ppm() else {
+            // Not ready yet. Ask for another frame so the readback can land.
+            return;
+        };
+        self.screenshot_requested = false;
+        self.last_screenshot = Some(self.write_screenshot(&ppm));
+    }
+
+    /// Write a PPM to disk and return a human-readable description of where.
+    ///
+    /// PPM rather than PNG deliberately: encoding a PNG needs a compression
+    /// dependency, and a raw dump is also the more honest artefact when
+    /// debugging a colour pipeline, because nothing has re-encoded the bytes
+    /// between the GPU and the file. macOS's `sips` converts it if a viewable
+    /// image is wanted.
+    fn write_screenshot(&self, ppm: &[u8]) -> String {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path =
+            std::env::temp_dir().join(format!("steel-pulse-{stamp}.ppm"));
+        match std::fs::write(&path, ppm) {
+            Ok(()) => format!("saved {}", path.display()),
+            Err(err) => format!("screenshot failed: {err}"),
         }
     }
 
@@ -322,6 +370,13 @@ impl eframe::App for App {
 
         if let Some(action) = self.core.pending_action.take() {
             self.core.apply_action(action);
+        }
+
+        // Retry any in-flight screenshot. Non-blocking: returns immediately
+        // until the GPU copy has landed, and asks for another frame meanwhile.
+        self.core.service_screenshot();
+        if self.core.screenshot_requested {
+            ui.ctx().request_repaint();
         }
 
         // Keep repainting while anything is still moving. Once the camera has
@@ -500,6 +555,40 @@ fn draw_plot(ui: &mut egui::Ui, core: &mut Core) {
     if let Some(texture) = core.plot_texture {
         egui::Image::from_texture(egui::load::SizedTexture::new(texture, rect.size()))
             .paint_at(ui, rect);
+    }
+
+    // Report where a screenshot went, so the user does not have to go looking
+    // in the temp directory for it. Click to dismiss.
+    if let Some(message) = core.last_screenshot.clone() {
+        let galley = ui.painter().layout_no_wrap(
+            message,
+            egui::FontId::monospace(12.0),
+            theme::Theme::TEXT,
+        );
+        let margin = 6.0;
+        let pad = 4.0;
+        let size = galley.size();
+        let box_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                rect.left() + 8.0,
+                rect.bottom() - size.y - 2.0 * pad - 8.0,
+            ),
+            egui::vec2(size.x + 2.0 * margin, size.y + 2.0 * pad),
+        );
+        let response =
+            ui.interact(box_rect, ui.id().with("screenshot_notice"), egui::Sense::click());
+        if response.clicked() {
+            core.last_screenshot = None;
+        }
+        ui.painter().rect_filled(box_rect, 2.0, theme::Theme::VOID);
+        ui.painter().rect_stroke(
+            box_rect,
+            2.0,
+            egui::Stroke::new(1.0, theme::Theme::CYAN_DIM),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter()
+            .galley(box_rect.min + egui::vec2(margin, pad), galley, theme::Theme::TEXT);
     }
 }
 

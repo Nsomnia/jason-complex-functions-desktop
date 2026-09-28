@@ -333,6 +333,166 @@ fn lock_timestamps(state: &Mutex<TimestampState>) -> std::sync::MutexGuard<'_, T
 }
 
 // ---------------------------------------------------------------------------
+// Readback: CPU-side capture of the plot image
+// ---------------------------------------------------------------------------
+
+/// Bytes per pixel in the storage texture: `rgba8unorm`.
+const BYTES_PER_PIXEL: usize = 4;
+
+/// Bytes per pixel in the PPM payload: `rgb`, alpha dropped.
+const BYTES_PER_OUTPUT_PIXEL: usize = 3;
+
+/// Row pitch wgpu requires for a texture-to-buffer copy, in bytes.
+///
+/// `wgpu::COPY_BYTES_PER_ROW_ALIGNMENT` is 256 and is a *requirement*, not a
+/// hint: a `bytes_per_row` that is not a multiple of it is a validation error
+/// at `copy_texture_to_buffer` time. It exists because a GPU copies rows as
+/// memory transactions, and a row that is not naturally aligned is copied as
+/// more, slower transactions.
+///
+/// The consequence for readback is that `width * 4` is usually *not* the pitch
+/// the buffer actually has, so the mapped bytes contain padding at the end of
+/// every row. That padding has to be stripped before the image makes any sense:
+/// leaving it in shifts every row left by a different amount and shears the
+/// picture into a staircase. This is the classic wgpu readback bug and the
+/// reason [`strip_rows`] exists as a separately testable pure function.
+const COPY_ROW_ALIGNMENT: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+
+/// Row pitch for a `width`-wide RGBA8 copy, rounded up to [`COPY_ROW_ALIGNMENT`].
+///
+/// Split out so the rounding rule has one implementation and one test. Note
+/// this is a `usize` and a plain `round_up`: the operands come from `u32` texture
+/// dimensions, so the product cannot overflow, but the function is written to be
+/// obviously total anyway rather than relying on that.
+fn padded_row_pitch(width: usize) -> usize {
+    let unpadded = width * BYTES_PER_PIXEL;
+    // `div_ceil` then `*` avoids the `+ alignment - 1` overflow trap, and is
+    // exact for every input here.
+    unpadded.div_ceil(COPY_ROW_ALIGNMENT) * COPY_ROW_ALIGNMENT
+}
+
+/// Copies `width * height` tightly-packed RGB pixels out of a padded RGBA8
+/// readback buffer, dropping the inter-row padding and the alpha channel.
+///
+/// `src` is the mapped staging buffer: `height` rows, each `padded_pitch` bytes
+/// apart, of which only the first `width * 4` are real pixels. `padded_pitch`
+/// must therefore be at least `width * 4`; anything less would read padding as
+/// if it were image data, and a short `src` would index out of bounds. Both are
+/// treated as errors rather than clamped, because in both cases the caller has
+/// a bug and a silently wrong picture is far harder to diagnose than a `None`.
+///
+/// Returns `None` for a zero width or height rather than an empty `Vec`, so
+/// that "nothing to read" is not confused with "an image with no pixels".
+///
+/// Pure by construction — no GPU, no allocation beyond the output — so the row
+/// arithmetic can be tested exhaustively without a device.
+fn strip_rows(src: &[u8], padded_pitch: usize, width: usize, height: usize) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let row_bytes = width.checked_mul(BYTES_PER_PIXEL)?;
+    if padded_pitch < row_bytes {
+        return None;
+    }
+    let required = padded_pitch.checked_mul(height)?;
+    if src.len() < required {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(width * height * BYTES_PER_OUTPUT_PIXEL);
+    for y in 0..height {
+        let row_start = y * padded_pitch;
+        for x in 0..width {
+            let pixel = row_start + x * BYTES_PER_PIXEL;
+            out.push(src[pixel]);
+            out.push(src[pixel + 1]);
+            out.push(src[pixel + 2]);
+            // The fourth byte is alpha. PPM has no alpha channel, and the
+            // compute pass writes a constant 1.0 there, so dropping it loses
+            // nothing.
+        }
+    }
+    Some(out)
+}
+
+/// The ASCII header of a binary PPM (P6), *not* including the trailing newline
+/// after the pixel data begins.
+///
+/// `P6` is the binary form, as opposed to `P3` which is ASCII and would triple
+/// the file size for no benefit. The header is exactly
+/// `"P6\n<width> <height>\n255\n"`: magic, then dimensions separated by a single
+/// space, then the maximum sample value, each on its own line.
+fn ppm_header(width: usize, height: usize) -> String {
+    format!("P6\n{width} {height}\n255\n")
+}
+
+/// Wraps tightly-packed RGB `pixels` in a complete P6 PPM file image.
+///
+/// Returns `None` if the payload length is not exactly `width * height * 3`, on
+/// the grounds that a header claiming dimensions the payload does not match
+/// produces a file that most viewers reject or silently mis-render. Catching it
+/// here names the bug.
+fn encode_ppm(pixels: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+    let expected = width
+        .checked_mul(height)?
+        .checked_mul(BYTES_PER_OUTPUT_PIXEL)?;
+    if width == 0 || height == 0 || pixels.len() != expected {
+        return None;
+    }
+    let header = ppm_header(width, height);
+    let mut out = Vec::with_capacity(header.len() + pixels.len());
+    out.extend_from_slice(header.as_bytes());
+    out.extend_from_slice(pixels);
+    Some(out)
+}
+
+/// Mutable state shared between the frame loop and the `map_async` callback that
+/// copies a finished readback out of the staging buffer.
+///
+/// Same shape and same reasoning as [`TimestampState`]: the mapping callback is
+/// `FnOnce(..) + Send + 'static` and so cannot borrow from `self`.
+#[derive(Debug, Default)]
+struct ReadbackState {
+    /// `true` between issuing `map_async` and its callback running. A buffer
+    /// that is currently mapped cannot be mapped again, so this is what stops a
+    /// second readback being started against the same staging buffer.
+    in_flight: bool,
+    /// A completed readback, carrying the dimensions it was issued for.
+    ///
+    /// The dimensions are part of the value rather than assumed to be current.
+    /// A resize between issuing the copy and the callback firing would otherwise
+    /// hand back an image whose header disagrees with [`Renderer::size`], and a
+    /// PPM with a wrong header is worse than no PPM.
+    pending: Option<(u32, u32, Vec<u8>)>,
+}
+
+/// Locks the readback state, recovering from poisoning instead of panicking.
+///
+/// Same justification as [`lock_timestamps`]: everything behind the lock is
+/// independently valid after a panic, and a screenshot feature is not worth
+/// turning into a dead render loop.
+fn lock_readback(state: &Mutex<ReadbackState>) -> std::sync::MutexGuard<'_, ReadbackState> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The staging buffer a readback copies through, and the geometry it was sized
+/// for.
+///
+/// Recreated on a size change and otherwise reused: a readback is a user
+/// action, not a per-frame thing, but repeated screenshots at the same size
+/// should not churn GPU allocations.
+struct ReadbackBuffer {
+    /// `COPY_DST | MAP_READ`, sized `padded_pitch * height`.
+    buffer: wgpu::Buffer,
+    /// Row pitch the copy is issued with, i.e. `padded_row_pitch(width)`.
+    padded_pitch: usize,
+    /// Dimensions this buffer was allocated for, used to detect a resize.
+    size: (u32, u32),
+}
+
+// ---------------------------------------------------------------------------
 // The storage target
 // ---------------------------------------------------------------------------
 
@@ -444,6 +604,13 @@ pub struct Renderer {
     timestamp_readback: Option<wgpu::Buffer>,
     /// Shared with the `map_async` callback; see [`TimestampState`].
     timestamp_state: Arc<Mutex<TimestampState>>,
+
+    /// Staging buffer for [`Renderer::read_ppm`], created on first use and
+    /// dropped on resize. `None` until a readback is actually requested, so a
+    /// session that never screenshots never allocates one.
+    readback_buffer: Option<ReadbackBuffer>,
+    /// Shared with the readback's `map_async` callback; see [`ReadbackState`].
+    readback_state: Arc<Mutex<ReadbackState>>,
 }
 
 impl Renderer {
@@ -593,6 +760,8 @@ impl Renderer {
             timestamp_query_set: None,
             timestamp_readback: None,
             timestamp_state: Arc::new(Mutex::new(TimestampState::default())),
+            readback_buffer: None,
+            readback_state: Arc::new(Mutex::new(ReadbackState::default())),
         })
     }
 
@@ -641,6 +810,20 @@ impl Renderer {
         // map, and the map would grow without bound over a session with many
         // window drags.
         self.unregister();
+
+        // The staging buffer is sized for the old geometry, so it is now the wrong
+        // shape. Dropping it here is the whole invalidation story: the next
+        // readback allocates a correctly sized one. Any copy already in flight
+        // keeps the old buffer alive through the callback's own handle clone, so
+        // this cannot pull memory out from under it.
+        self.readback_buffer = None;
+        // And discard any completed readback: its PPM header describes the old
+        // dimensions, which would now disagree with `size()`.
+        {
+            let mut state = lock_readback(&self.readback_state);
+            state.pending = None;
+            state.in_flight = false;
+        }
 
         self.size = (width, height);
         let target = build_storage_target(
@@ -798,6 +981,259 @@ impl Renderer {
     /// back what the last frame uploaded.
     pub fn uniform_buffer(&self) -> &wgpu::Buffer {
         &self.uniform_buffer
+    }
+
+    /// Reads the plot image back off the GPU and encodes it as a binary PPM (P6).
+    ///
+    /// This exists because verifying a rendered frame in this environment is
+    /// otherwise impossible: OS screenshot tooling captures a different surface
+    /// than the GUI session draws into, and window enumeration is blocked by
+    /// permissions. Reading the storage texture directly sidesteps the
+    /// compositor entirely, so what comes back is what the compute pass actually
+    /// produced rather than what the platform happened to show.
+    ///
+    /// It is also the implementation of the screenshot action, so it is a real
+    /// feature rather than test scaffolding.
+    ///
+    /// # This is asynchronous. Call it until it returns `Some`.
+    ///
+    /// The copy is submitted and the staging buffer is mapped, but wgpu only
+    /// completes a mapping on a later `Device::poll`, and the only way to wait
+    /// for that is `PollType::Wait` — which blocks the UI thread for as long as
+    /// the GPU takes. On a 4K plot with 4096 iterations that is seconds, during
+    /// which the window is frozen. So this polls **non-blocking** and returns
+    /// `None` if the data has not arrived:
+    ///
+    /// ```ignore
+    /// // Each frame, while the user is waiting for a screenshot:
+    /// if let Some(ppm) = renderer.read_ppm() {
+    ///     std::fs::write(path, &ppm).ok();
+    /// }
+    /// ```
+    ///
+    /// Calling it once and giving up on `None` will simply never produce an
+    /// image. Call it every frame until it yields `Some`; it is cheap, because a
+    /// second call while a mapping is outstanding does nothing but poll.
+    ///
+    /// # What the bytes mean
+    ///
+    /// The texture is `Rgba8Unorm`, **not** `Rgba8UnormSrgb`. These are the raw
+    /// values the compute pass wrote, with no gamma encoding and no display
+    /// transform applied, and the alpha channel is dropped because PPM has no
+    /// alpha. A viewer will apply its own transform on top, so the file will look
+    /// *different* from what the on-screen compositor produced — typically
+    /// darker in the midtones, because these are closer to linear than to
+    /// display-referred.
+    ///
+    /// That difference is not a readback bug. Whether the presentation path
+    /// should be applying a gamma curve is an open question recorded in
+    /// `TODO.md`, and this function deliberately does not try to answer it: it
+    /// reports what the GPU produced, and whoever looks at the image needs to
+    /// know the bytes are un-encoded so they do not chase a difference that is
+    /// supposed to be there.
+    ///
+    /// Nothing is sanitised. A non-finite or otherwise nonsensical pixel reaches
+    /// the file exactly as written, because the point of the capture is to
+    /// reproduce the GPU's output and a scrubbed image would hide the very bug it
+    /// was taken to find.
+    ///
+    /// # Returns
+    ///
+    /// `Some(ppm)` — the complete contents of a `.ppm` file, header and all —
+    /// once the readback lands, or `None` while it is still in flight or if the
+    /// current size is degenerate.
+    pub fn read_ppm(&mut self) -> Option<Vec<u8>> {
+        let (width, height) = self.size;
+
+        // `resize` clamps to 1x1, so this is a second line of defence rather than
+        // a reachable path. It lives here anyway because this is the function
+        // that would size a zero-length buffer, and a `0`-sized `create_buffer`
+        // is a validation error that poisons the device. Cheap insurance on the
+        // one path that can actually do the damage.
+        if width == 0 || height == 0 {
+            return None;
+        }
+
+        // A completed readback whose dimensions still match is returned at once,
+        // with no GPU work. The dimension check is what makes a resize safe: a
+        // PPM whose header disagrees with `size()` is worse than no PPM.
+        if let Some(result) = Self::take_matching_readback(&self.readback_state, self.size) {
+            return Some(result);
+        }
+
+        if !self.ensure_readback_buffer(width, height) {
+            return None;
+        }
+
+        // Read the in-flight flag through a short-lived guard rather than holding
+        // one across `issue_readback`, which needs `&mut self`. Setting the flag
+        // afterwards is safe because nothing else runs between the two points:
+        // this is the only writer, on the thread that drives the frame loop.
+        //
+        // If a mapping is already outstanding, do nothing but poll below. A
+        // buffer that is currently mapped cannot be mapped again, and issuing a
+        // second copy into it would race the first.
+        if !lock_readback(&self.readback_state).in_flight {
+            if self.issue_readback(width, height) {
+                lock_readback(&self.readback_state).in_flight = true;
+            }
+        }
+
+        // One non-blocking poll so a readback that already completed is decoded on
+        // this call rather than the next. `Poll` never waits, so it cannot stall
+        // the frame loop; a device error here is not actionable and is reported
+        // through the uncaptured-error handler.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+
+        Self::take_matching_readback(&self.readback_state, self.size)
+    }
+
+    /// Returns the completed readback if one exists for exactly `size`, or
+    /// `None`.
+    ///
+    /// A mismatched result is discarded rather than returned, so a capture taken
+    /// across a resize cannot reach the caller with stale dimensions.
+    fn take_matching_readback(state: &Mutex<ReadbackState>, size: (u32, u32)) -> Option<Vec<u8>> {
+        let mut guard = lock_readback(state);
+        match guard.pending.take() {
+            Some((w, h, ppm)) if (w, h) == size => Some(ppm),
+            // Wrong dimensions, or nothing pending. Either way the value is gone.
+            _ => None,
+        }
+    }
+
+    /// Ensures a staging buffer exists that is correctly shaped for
+    /// `width` x `height`, returning whether one is usable.
+    ///
+    /// Recreated when absent or when the geometry changed; reused otherwise, so
+    /// repeated screenshots at the same size do not churn GPU allocations. The
+    /// reuse is only safe because a buffer that is still mapped is never reused:
+    /// see [`Renderer::read_ppm`], which checks `in_flight` before getting here.
+    fn ensure_readback_buffer(&mut self, width: u32, height: u32) -> bool {
+        let padded_pitch = padded_row_pitch(width as usize);
+        let capacity = match (padded_pitch as u64).checked_mul(u64::from(height)) {
+            Some(bytes) if bytes > 0 => bytes,
+            // Zero or overflowing. A zero-sized buffer is a validation error, so
+            // report failure rather than allocating.
+            _ => return false,
+        };
+
+        if let Some(existing) = &self.readback_buffer {
+            if existing.size == (width, height) && existing.padded_pitch == padded_pitch {
+                return true;
+            }
+        }
+
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("steel-pulse:readback"),
+            // `padded_pitch * height`, not `width * 4 * height`. The copy writes
+            // whole padded rows, so a buffer sized to the *visible* data would be
+            // overwritten out of bounds for any width whose row needs padding.
+            size: capacity,
+            // `COPY_DST` is the copy's destination; `MAP_READ` is what lets the
+            // CPU read it back. Nothing ever writes to it from the CPU, so
+            // `COPY_SRC` is deliberately absent.
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        self.readback_buffer = Some(ReadbackBuffer {
+            buffer,
+            padded_pitch,
+            size: (width, height),
+        });
+        true
+    }
+
+    /// Submits a copy of the whole plot image into the staging buffer and asks
+    /// wgpu to map it, arranging for the result to be decoded in the callback.
+    ///
+    /// Returns whether a mapping was actually requested, so the caller only sets
+    /// the in-flight flag when there is genuinely something to wait for. A `false`
+    /// here leaves the state untouched and the next call retries.
+    ///
+    /// Caller must have already established that no mapping is outstanding.
+    fn issue_readback(&mut self, width: u32, height: u32) -> bool {
+        let Some(readback) = self.readback_buffer.as_ref() else {
+            return false;
+        };
+        let padded_pitch = readback.padded_pitch;
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("steel-pulse:readback:copy"),
+            });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.storage_texture,
+                // Single mip level, single layer, whole extent: this is a
+                // straight full-image copy.
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback.buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    // MUST be a multiple of `COPY_BYTES_PER_ROW_ALIGNMENT` or
+                    // wgpu rejects the copy. `padded_row_pitch` guarantees that,
+                    // and the `None` here is deliberate: passing `Some(width * 4)`
+                    // is the single most common readback bug.
+                    bytes_per_row: Some(padded_pitch as u32),
+                    // Single-layer image, so this is optional. Stated anyway so
+                    // the geometry is all in one place.
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // The callback owns everything it needs by value: the buffer handle (so
+        // it can read the mapping and unmap), the geometry, and a clone of the
+        // shared state. It cannot borrow `self`, and by the time it runs the
+        // renderer may have been resized, so it must not.
+        let buffer = readback.buffer.clone();
+        let state = Arc::clone(&self.readback_state);
+        readback
+            .buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let mut state = lock_readback(&state);
+                // Always clear the in-flight flag, even on failure, or no further
+                // readback would ever be attempted.
+                state.in_flight = false;
+
+                if result.is_err() {
+                    return;
+                }
+                let Ok(view) = buffer.slice(..).get_mapped_range() else {
+                    return;
+                };
+                // The mapped view is `padded_pitch * height` bytes; the tail of
+                // each row is padding and is discarded by `strip_rows`.
+                let pixels = strip_rows(&view, padded_pitch, width as usize, height as usize);
+                // Unmap before releasing the guard's scope, and always: a buffer
+                // left mapped can never be mapped again, and `ensure_readback_buffer`
+                // would happily hand the same buffer back for the next screenshot.
+                drop(view);
+                buffer.unmap();
+
+                if let Some(pixels) = pixels {
+                    if let Some(ppm) = encode_ppm(&pixels, width as usize, height as usize) {
+                        state.pending = Some((width, height, ppm));
+                    }
+                }
+            });
+        true
     }
 
     /// Tries to turn on GPU timing for the compute pass.
@@ -1093,9 +1529,27 @@ fn build_storage_target(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: STORAGE_FORMAT,
-        // `STORAGE_BINDING` for the compute pass's write-only image,
-        // `TEXTURE_BINDING` for egui's `texture_2d<f32>`.
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        // Three usages, and the third is the one that needs justifying:
+        //
+        // * `STORAGE_BINDING` — the compute pass's write-only image.
+        // * `TEXTURE_BINDING` — egui's `texture_2d<f32>` when it blits the plot.
+        // * `COPY_SRC` — the source of a `copy_texture_to_buffer`, i.e.
+        //   [`Renderer::read_ppm`] and the screenshot action.
+        //
+        // `COPY_SRC` looks wrong because the app never draws this texture, and
+        // that is exactly the point: nothing in the *rendering* path copies from
+        // it. It is declared anyway because texture usages are fixed at creation
+        // time — you cannot add one later — and readback is a core feature of
+        // this renderer, not an afterthought. Without it, adding screenshots
+        // would mean rebuilding this texture and re-registering it with egui
+        // just to gain a flag.
+        //
+        // The cost is a copy engine being able to read the texture, which is
+        // free on every backend that matters and is not a per-frame cost because
+        // the readback is a user action.
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
 
@@ -1236,3 +1690,192 @@ const _: () = {
     fn assert_send_sync<T: Send + Sync>() {}
     let _checked: fn() = assert_send_sync::<Renderer>;
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A width whose RGBA row is 400 bytes, so its 256-byte-aligned pitch is
+    /// 512. Chosen deliberately: `width * 4 != padded_pitch`, which is the case
+    /// that makes the readback interesting. A width that happened to be a
+    /// multiple of 64 pixels would have identical pitch and row stride, and every
+    /// stripping bug would pass unnoticed.
+    const W: usize = 100;
+    const H: usize = 3;
+    const UNPADDED_ROW: usize = W * BYTES_PER_PIXEL; // 400
+    const PADDED_ROW: usize = 512; // 400 rounded up to a multiple of 256
+
+    /// Builds a synthetic staging buffer: `H` rows of `UNPADDED_ROW` real bytes,
+    /// each followed by `PADDED_ROW - UNPADDED_ROW` bytes of recognisable
+    /// padding.
+    ///
+    /// The padding is filled with `0xAB` rather than zeros so that a test which
+    /// fails to strip it produces a visibly wrong picture instead of a
+    /// subtly wrong one.
+    fn synthetic_readback() -> Vec<u8> {
+        let mut src = Vec::with_capacity(PADDED_ROW * H);
+        for y in 0..H {
+            for x in 0..W {
+                // A per-pixel value that encodes its own coordinates, so a
+                // mis-strided read is unambiguous rather than merely wrong.
+                src.push((x % 256) as u8);
+                src.push((y % 256) as u8);
+                src.push(((x + y) % 256) as u8);
+                src.push(0xFF); // alpha
+            }
+            src.resize(src.len() + (PADDED_ROW - UNPADDED_ROW), 0xAB);
+        }
+        src
+    }
+
+    /// The value `synthetic_readback` stores for pixel `(x, y)`, post-strip.
+    fn expected_rgb(x: usize, y: usize) -> [u8; 3] {
+        [(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8]
+    }
+
+    #[test]
+    fn padded_pitch_rounds_up_to_the_alignment() {
+        // The case under test: 400 -> 512.
+        assert_eq!(padded_row_pitch(W), PADDED_ROW);
+        assert_ne!(padded_row_pitch(W), UNPADDED_ROW);
+        // The pitch must be a multiple of the alignment, always.
+        for width in [1usize, 63, 64, 65, 100, 256, 257, 1000] {
+            let pitch = padded_row_pitch(width);
+            assert_eq!(pitch % COPY_ROW_ALIGNMENT, 0, "width {width}");
+            assert!(pitch >= width * BYTES_PER_PIXEL, "width {width}");
+        }
+        // An exactly-aligned width is its own pitch; nothing is wasted.
+        assert_eq!(padded_row_pitch(64), 64 * BYTES_PER_PIXEL);
+        assert_eq!(padded_row_pitch(1), COPY_ROW_ALIGNMENT);
+    }
+
+    #[test]
+    fn strip_rows_removes_padding_and_alpha() {
+        let src = synthetic_readback();
+        assert_eq!(src.len(), PADDED_ROW * H);
+
+        let out = strip_rows(&src, PADDED_ROW, W, H).expect("valid geometry");
+
+        // Exactly three bytes per pixel, no padding, no alpha.
+        assert_eq!(out.len(), W * H * 3);
+
+        // Every pixel of every row must land at the right stride. This is the
+        // assertion that fails if the pitch is confused with `width * 4`: row 1
+        // would then start 112 bytes early and every subsequent row would shear.
+        for y in 0..H {
+            for x in 0..W {
+                let base = (y * W + x) * 3;
+                assert_eq!(&out[base..base + 3], expected_rgb(x, y), "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn strip_rows_matches_a_width_that_needs_no_stripping() {
+        // An independent reference. A 64-wide image has `64 * 4 == 256`, exactly
+        // one alignment unit, so it needs no stripping and its "staging buffer" is
+        // already tight. The first 64 columns of the padded 100-wide image must
+        // strip to exactly this.
+        //
+        // Compared **row by row**, not over one flat prefix: a flat prefix would
+        // compare 100-wide row 0 against 64-wide row 0 and then 100-wide row 1
+        // against the tail of 64-wide row 0, which is a different comparison that
+        // can pass while the real thing is broken. (An earlier version of this
+        // test made exactly that mistake and failed here.)
+        const NARROW: usize = 64;
+
+        // Precondition that makes the cross-check meaningful.
+        assert_eq!(padded_row_pitch(NARROW), NARROW * BYTES_PER_PIXEL);
+
+        let mut reference = Vec::new();
+        for y in 0..H {
+            for x in 0..NARROW {
+                reference.extend_from_slice(&expected_rgb(x, y));
+            }
+        }
+        assert_eq!(reference.len(), H * NARROW * 3);
+
+        let stripped = strip_rows(&synthetic_readback(), PADDED_ROW, W, H).unwrap();
+        for y in 0..H {
+            let got = &stripped[y * W * 3..y * W * 3 + NARROW * 3];
+            let want = &reference[y * NARROW * 3..(y + 1) * NARROW * 3];
+            assert_eq!(got, want, "row {y}");
+        }
+    }
+
+    #[test]
+    fn strip_rows_rejects_inconsistent_geometry() {
+        let src = synthetic_readback();
+        // A pitch too small to hold a row would read padding as image data.
+        assert!(strip_rows(&src, UNPADDED_ROW - 4, W, H).is_none());
+        // A source shorter than `pitch * height` would index out of bounds.
+        assert!(strip_rows(&src[..src.len() - 1], PADDED_ROW, W, H).is_none());
+        // Zero dimensions are "nothing to read", not "an empty image".
+        assert!(strip_rows(&src, PADDED_ROW, 0, H).is_none());
+        assert!(strip_rows(&src, PADDED_ROW, W, 0).is_none());
+        // An empty source cannot satisfy any non-empty geometry.
+        assert!(strip_rows(&[], PADDED_ROW, W, H).is_none());
+    }
+
+    #[test]
+    fn ppm_header_is_exact() {
+        assert_eq!(ppm_header(100, 3), "P6\n100 3\n255\n");
+        assert_eq!(ppm_header(1, 1), "P6\n1 1\n255\n");
+        // A large width must not be formatted with separators or truncation.
+        assert_eq!(ppm_header(3840, 2160), "P6\n3840 2160\n255\n");
+    }
+
+    #[test]
+    fn encode_ppm_appends_exactly_the_header() {
+        let pixels = vec![0xABu8; W * H * 3];
+        let ppm = encode_ppm(&pixels, W, H).expect("valid payload");
+        let header = "P6\n100 3\n255\n";
+
+        assert_eq!(&ppm[..header.len()], header.as_bytes());
+        assert_eq!(ppm.len(), header.len() + W * H * 3);
+        assert_eq!(&ppm[header.len()..], &pixels[..]);
+    }
+
+    #[test]
+    fn strip_then_encode_produces_a_coherent_file() {
+        // The end-to-end pure path: synthetic staging buffer in, a well-formed
+        // P6 file out, with the payload exactly the stripped pixels.
+        let stripped = strip_rows(&synthetic_readback(), PADDED_ROW, W, H).unwrap();
+        let ppm = encode_ppm(&stripped, W, H).unwrap();
+        let header = "P6\n100 3\n255\n";
+
+        assert!(ppm.starts_with(header.as_bytes()));
+        assert_eq!(&ppm[header.len()..], &stripped[..]);
+        assert_eq!(ppm.len(), header.len() + W * H * 3);
+    }
+
+    #[test]
+    fn encode_ppm_rejects_a_payload_that_disagrees_with_its_header() {
+        // A PPM whose header claims dimensions the payload does not match is
+        // worse than no PPM, so it must not be produced.
+        assert!(encode_ppm(&[], W, H).is_none());
+        assert!(encode_ppm(&vec![0; W * H * 3 - 1], W, H).is_none());
+        assert!(encode_ppm(&vec![0; W * H * 3 + 1], W, H).is_none());
+        // Still fine when the payload matches exactly.
+        assert!(encode_ppm(&vec![0; W * H * 3], W, H).is_some());
+        // Zero dimensions are rejected even with an "empty" payload.
+        assert!(encode_ppm(&[], 0, 0).is_none());
+    }
+
+    #[test]
+    fn readback_pitch_is_never_smaller_than_the_visible_row() {
+        // The invariant the staging buffer size depends on: if the pitch could
+        // come out smaller than `width * 4`, the copy would run past the row and
+        // the buffer size would be under-computed.
+        for width in 1usize..600 {
+            assert!(
+                padded_row_pitch(width) >= width * BYTES_PER_PIXEL,
+                "{width}"
+            );
+        }
+    }
+}
