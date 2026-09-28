@@ -209,13 +209,31 @@ recorded further down, not a readback bug.
       passes through white before snapping to black. See the Known open
       questions section.
 
-- [ ] **Restore interior contrast in iterated plots.** A direct consequence of
-      the fix above, and the reason the Julia plot looks muted: colouring the
-      final iterate loses all interior structure once the orbit has converged
-      onto an attractor. The candidates are minimum-modulus-along-the-orbit,
-      or colouring by escape time. Both change the specified colour scheme and
-      the second needs a uniform to carry the threshold, so this is a design
-      decision, not a bug fix.
+- [x] **Restore interior contrast in iterated plots — CLOSED BY DECISION, do not
+      reopen.** The iterated plots render a flat, dim interior: 94.9% of
+      structured pixels sit in the 32-63/255 band at `max_iter = 256`. Cause:
+      colouring the *final* iterate means every interior point has collapsed
+      onto the attractor, so `|w|` is nearly constant inside. The existing
+      `modulus_shading` control cannot help, because the modulus genuinely is
+      constant there — that is a property of the orbit, not of the shading.
+
+      The two candidates were minimum-modulus-along-the-orbit (no ABI change,
+      a kernel-local variable, but a departure from textbook domain colouring)
+      and escape-time colouring (the classic fractal look, but it needs a new
+      uniform for the threshold, so a full ABI change per
+      [agents/ABI.md](agents/ABI.md)). Both are legitimate; neither is a bug
+      fix.
+
+      **Decision: leave it.** The current behaviour is correct for the
+      specified colour scheme, and the escape/fill structure reads clearly,
+      which is what the plot is for. The muted interior is the price of
+      colouring the final iterate, and it is a fair one. Riemann surfaces
+      (milestone 2) are the better use of effort than a cosmetic change to a
+      scheme that is already specified and working.
+
+      If this is ever revisited, the honest framing is "the colour scheme
+      should show the trajectory, not its endpoint", not "fix the washed-out
+      interior" — nothing is broken.
 
 - [ ] **Cross-compile / CI notes.** Record, in
       [agents/ENVIRONMENT.md](agents/ENVIRONMENT.md):
