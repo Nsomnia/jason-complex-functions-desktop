@@ -2928,6 +2928,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_dock",
+ "pollster",
  "wgpu",
 ]
 
