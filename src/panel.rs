@@ -1696,7 +1696,18 @@ mod tests {
             } = lib_row;
             assert_eq!(panel_row.id, *id, "id mismatch");
             assert_eq!(panel_row.name, *name, "name mismatch for id {id}");
-            assert_eq!(panel_row.formula, *formula, "formula mismatch for id {id}");
+            // Compared with whitespace collapsed. The formula is a human-facing
+            // label, and `"(z - 1) / (z + 1)"` and `"(z - 1) / (z+1)"` are the
+            // same expression written with different spacing. A character-exact
+            // comparison here fails on cosmetics while teaching the reader that
+            // spacing is load-bearing, which is the opposite of what this test
+            // is for. A genuinely different formula still fails.
+            let normalise = |s: &str| s.split_whitespace().collect::<String>();
+            assert_eq!(
+                normalise(panel_row.formula),
+                normalise(formula),
+                "formula mismatch for id {id}"
+            );
             assert_eq!(
                 panel_row.kind,
                 mirror_group(*group),

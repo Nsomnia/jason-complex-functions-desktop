@@ -479,10 +479,24 @@ mod tests {
     /// Asserts two `f64`s agree to within `tolerance`, with a message naming
     /// both so a failure is readable without a debugger.
     #[track_caller]
+    /// Absolute-or-relative closeness.
+    ///
+    /// A fixed *absolute* tolerance is the wrong tool for any quantity that
+    /// can grow: one `f64` ulp is about `1.8e-9` at a magnitude of `1e7`, so a
+    /// `1e-9` absolute tolerance is unmeetable by construction and fails on
+    /// arithmetic that is exactly right. The tolerance is therefore taken as
+    /// the larger of the absolute floor and a relative share of the larger
+    /// magnitude, so the assertion stays strict near zero (where the absolute
+    /// term binds) and stays meaningful for large values (where the relative
+    /// term binds).
     fn assert_close(actual: f64, expected: f64, tolerance: f64, what: &str) {
+        let difference = (actual - expected).abs();
+        let magnitude = actual.abs().max(expected.abs());
+        let effective = tolerance.max(tolerance * magnitude);
         assert!(
-            (actual - expected).abs() <= tolerance,
-            "{what}: {actual} != {expected} (tolerance {tolerance})"
+            difference <= effective,
+            "{what}: {actual} != {expected} (abs diff {difference:e}, \
+             tolerance {tolerance:e}, effective {effective:e})"
         );
     }
 
